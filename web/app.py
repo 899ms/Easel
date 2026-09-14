@@ -2283,8 +2283,8 @@ async def api_logout(platform: str):
     return {'ok': True, 'deleted': deleted}
 
 
-# 归因层：可抓创作数据的平台（多数走 Playwright 登录态；bilibili 用 biliup cookies、
-# wechat-oa 用官方 datacube API，均不起浏览器）
+# 归因层：可抓创作数据的平台（多数走 Playwright 登录态；bilibili 用 biliup cookies 不起浏览器、
+# wechat-oa 走 mp 后台会话 Playwright 拦截数据 XHR）
 ANALYTICS_PLATFORMS = {"xiaohongshu", "douyin", "kuaishou", "zhihu", "weixin-channels", "bilibili", "wechat-oa"}
 
 
@@ -2303,7 +2303,7 @@ async def api_analytics(platform: str):
     """抓取某平台已登录账号的创作数据（粉丝/获赞/作品 + 与上次快照的增长）。起 headless 浏览器，数秒。"""
     if platform not in ANALYTICS_PLATFORMS:
         raise HTTPException(404, "该平台暂不支持数据抓取")
-    # B站用 cookie 调 API、公众号用官方 datacube API（均无浏览器 profile），单独分支；其余走 account_stats（Playwright）
+    # B站用 cookie 调 API（无浏览器 profile）、公众号走 mp 后台会话（Playwright 拦截数据 XHR，见下），单独分支；其余走 account_stats（Playwright）
     if platform == "bilibili":
         cmd = [sys.executable, str(SHARED_SCRIPTS / "bili_login.py"), "stats",
                "--cookie", str(PROJECT_ROOT / "cookies.json")]

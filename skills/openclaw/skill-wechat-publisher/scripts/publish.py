@@ -20,6 +20,7 @@ import re
 import json
 import argparse
 import tempfile
+import uuid
 from pathlib import Path
 from typing import Optional
 
@@ -172,7 +173,9 @@ def _session_publish_html(html_content, cover_path, title, digest="", author="",
     shared = Path(__file__).resolve().parents[3] / "shared" / "scripts"
     base = Path(base_dir) if base_dir else Path(_default_temp_dir())
     base.mkdir(parents=True, exist_ok=True)
-    html_tmp = base / f".session_{Path(_default_temp_dir()).name}.html"
+    # 只需一个随机文件名，别再调 _default_temp_dir()（它会 mkdtemp 真建目录，
+    # 每次发布遗留一个空的 wechat_images_XXXX/）。用 uuid 取随机名即可。
+    html_tmp = base / f".session_{uuid.uuid4().hex}.html"
     html_tmp.write_text(html_content, encoding="utf-8")
     # 默认直连（mp 为国内站）；受限网络可用 EASEL_PROXY / https_proxy 指定正向代理
     proxy = _os.environ.get("EASEL_PROXY") or _os.environ.get("https_proxy") or ""

@@ -133,7 +133,9 @@ def cmd_login(a):
                 page.wait_for_timeout(2000)
                 if _extract_token(page.url):
                     login_state.write_status(status, "success", "登录成功")
-                    print("login success, token=", _extract_token(page.url))
+                    # 不打印 token 值：它是 mp 后台会话令牌，stdout 会落进
+                    # outputs/_login/wechat-oa-mp.log，避免敏感值明文落盘。
+                    print("login success, token acquired")
                     return 0
                 # 二维码可能刷新，定期重截
                 try:
