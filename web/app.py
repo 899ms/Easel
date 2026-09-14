@@ -1111,6 +1111,11 @@ async def api_chat_stream(req: ChatRequest):
         env = _proxy_env()
         env["OPENCLAW_RAW_STREAM"] = "1"
         env["OPENCLAW_RAW_STREAM_PATH"] = str(raw_path)
+        # 告诉 skill：本部署的 ask_user 选项卡片是否可用。卡片依赖 gateway 的
+        # question.* RPC（仅 2026.9.x 有），2026.6.11 上桥接不可用 → skill 改用
+        # 「文字问答跨轮等待」拿短信验证码，而不是空等卡片超时。
+        _cards_ok = question_bridge_supported is not None and question_bridge_supported()
+        env["EASEL_ASKUSER_CARDS"] = "1" if _cards_ok else "0"
 
         # 会话级串行：同一会话若已有请求在跑，先提示排队，等它结束再开
         # （否则两个 openclaw 进程并发写同一 session 文件 → 崩溃 rc=1 / 会话串味）。
