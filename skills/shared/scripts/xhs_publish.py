@@ -468,6 +468,15 @@ def _wait_sel(page, selector: str, timeout_ms: int = 15000, what: str = "元素"
     raise TimeoutError(f"等待 {what} 超时（{timeout_ms}ms）：{selector}")
 
 
+def _query_safe(page, selector: str):
+    """query_selector 的容错版：导航瞬间 context 被销毁会抛异常，这里吞掉返回
+    None。裸 query_selector 在页面跳转期会崩，用它做一次性登录态探测更稳。"""
+    try:
+        return page.query_selector(selector)
+    except Exception:
+        return None
+
+
 def cmd_login(a) -> int:
     """headless 友好登录：把二维码抠成 PNG 供扫码，轮询登录成功后持久化 cookie。
     REF login.go FetchQrcodeImage/WaitForLogin。远程无桌面环境靠图片扫码，非有头窗口。"""
@@ -636,7 +645,15 @@ def _publish(a, kind: str) -> int:
         try:
             page.goto(PUBLISH_URL, wait_until="domcontentloaded")
             page.wait_for_timeout(1500)
-            if not page.query_selector(SELECTORS["login_ok"]) and "login" in page.url.lower():
+            # 登录态探测容忍导航竞态：发布页也可能仍在跳转，跳转瞬间裸 query 会抛
+            # context-destroyed；重试几次再据 url 判定「未登录」，避免误报。
+            logged = False
+            for _ in range(4):
+                if _query_safe(page, SELECTORS["login_ok"]) is not None:
+                    logged = True
+                    break
+                page.wait_for_timeout(500)
+            if not logged and "login" in page.url.lower():
                 _die("未登录，请先 `login` 扫码")
             if kind == "image":
                 _click_publish_tab(page, "上传图文")
@@ -690,7 +707,7 @@ def cmd_whoami(a) -> int:
                     page.wait_for_selector(SELECTORS["login_ok"], timeout=4000)
                 except Exception:
                     pass
-                logged = bool(page.query_selector(SELECTORS["login_ok"]))
+                logged = _query_safe(page, SELECTORS["login_ok"]) is not None
                 result["loggedIn"] = logged
                 if logged:
                     img = page.query_selector('.main-container .user img.reds-img')
