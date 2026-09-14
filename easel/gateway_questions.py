@@ -19,10 +19,13 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 import sqlite3
+import subprocess
 import sys
 import threading
 import time
+from functools import lru_cache
 from pathlib import Path
 
 # --- path resolution -------------------------------------------------------
@@ -45,6 +48,45 @@ GATEWAY_PROTOCOL_MIN = 4
 GATEWAY_PROTOCOL_MAX = 4
 CLIENT_ID = "cli"
 CLIENT_VERSION = "2026.9.2"
+
+# The gateway question.* RPC surface (ask_user option cards) was introduced in
+# the 2026.9.x line. On older gateways those methods answer INVALID_REQUEST and,
+# worse, each connect attempt raises a fresh scope-upgrade pairing request. So
+# on <2026.9 we skip the bridge entirely rather than poke the gateway per turn.
+QUESTION_RPC_MIN_VERSION = (2026, 9, 0)
+
+
+@lru_cache(maxsize=1)
+def _openclaw_version() -> tuple[int, int, int] | None:
+    """Best-effort parse of `openclaw --version` → (year, month, patch)."""
+    try:
+        from .openclaw_cmd import openclaw_base_cmd
+
+        result = subprocess.run(
+            openclaw_base_cmd() + ["--version"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode != 0:
+            return None
+        m = re.search(r"(\d+)\.(\d+)\.(\d+)", result.stdout)
+        if not m:
+            return None
+        return (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    except Exception:
+        return None
+
+
+def question_bridge_supported() -> bool:
+    """Whether this OpenClaw version exposes the question.* RPC.
+
+    Unknown/unparseable version → assume supported (fail open): the caller's
+    runtime circuit breaker still catches a persistently failing connect, so we
+    don't silently disable cards on a version string we merely couldn't parse.
+    """
+    ver = _openclaw_version()
+    if ver is None:
+        return True
+    return ver >= QUESTION_RPC_MIN_VERSION
 
 
 def _client_identity() -> dict:

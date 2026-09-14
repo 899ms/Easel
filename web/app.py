@@ -39,15 +39,21 @@ from easel.persona import load_profile_text, persona_prefix, chat_turn_message, 
 from easel.timeouts import TIMEOUT_CHAT, TIMEOUT_DIRECT, TIMEOUT_PRODUCE
 try:
     from easel.gateway_questions import (
-        GatewayClient, GatewayQuestionError, GatewayUnsupportedError)
+        GatewayClient, GatewayQuestionError, GatewayUnsupportedError,
+        question_bridge_supported)
 except Exception:  # 兼容缺失依赖：问答题桥接降级为关闭
     GatewayClient = None  # type: ignore
     GatewayQuestionError = None  # type: ignore
     GatewayUnsupportedError = None  # type: ignore
+    question_bridge_supported = None  # type: ignore
 
 # 问答题桥接的一次性诊断标记：连接失败/旧版本无 question RPC 的告警每进程只打一次，
 # 避免每开一个新会话就在后端刷一行同样的错（用户反馈的噪音）。
 _QBRIDGE_WARNED: set[str] = set()
+# 进程级熔断：一旦确认桥接不可用（旧版本无 question RPC、或 connect 持续失败如
+# NOT_PAIRED/scope-upgrade），就彻底停掉桥接，后续每轮直接跳过——不再连接，也就不再
+# 每轮在网关上触发新的配对/权限申请。恢复需重启 easel web。
+_QBRIDGE_DISABLED = False
 
 
 def _qbridge_warn_once(key: str, message: str) -> None:
@@ -1184,22 +1190,33 @@ async def api_chat_stream(req: ChatRequest):
         # 背景：OpenClaw 的 ask_user 注册到 gateway 进程内，Easel 前端不消费 question RPC → 选项不可见。
         # 这里在 agent 运行期间每 2s 轮询一次，把新出现的 pending question 以 SSE `question` 事件推送，
         # 前端渲染选项卡片；用户点击后经 /api/chat/question/answer 调 question.resolve 完成回答。
-        if GatewayClient is not None:
+        if GatewayClient is not None and not _QBRIDGE_DISABLED:
             def _question_poll():
+                global _QBRIDGE_DISABLED
+                if _QBRIDGE_DISABLED:
+                    return
+                # 版本能力门：旧版本 OpenClaw（<2026.9.x）没有 question.* RPC，连都不连——
+                # 否则每轮 connect 都在网关上触发新的 scope-upgrade 配对申请。只提示一次，走文字问答。
+                if question_bridge_supported is not None and not question_bridge_supported():
+                    _QBRIDGE_DISABLED = True
+                    _qbridge_warn_once(
+                        "unsupported",
+                        "[question-bridge] 当前 OpenClaw 版本无 question RPC（需 2026.9.x+），"
+                        "已跳过 ask_user 选项卡片桥接，改用文字问答。")
+                    return
                 client = None
                 pushed: set[str] = set()
                 try:
                     client = GatewayClient()
                     client.connect()
                 except Exception as e:
-                    # gateway 不可达：不阻塞对话主流程（本轮退化为无选项，agent 会 no_answer 自行续）。
-                    # 但要留下痕迹：设备未配对或客户端元数据不匹配时这里会持续失败，
-                    # 前端表现仅仅是「卡片不出现」，静默 return 会让人完全无从排查。
-                    # 每进程只告警一次，避免每个新会话都刷同一行错。
+                    # connect 失败（如 NOT_PAIRED/scope-upgrade，或网关不可达）：熔断整个桥接，
+                    # 不再每轮重试——否则每轮都会在网关上堆一个新的配对/权限申请。每进程只告警一次。
+                    _QBRIDGE_DISABLED = True
                     _qbridge_warn_once(
                         "connect",
-                        f"[question-bridge] connect gateway failed, "
-                        f"ask_user 选项卡片本次不可用: {e}")
+                        f"[question-bridge] connect gateway failed，已停用桥接（本进程），"
+                        f"ask_user 改用文字问答: {e}")
                     return
                 try:
                     while proc.poll() is None:
@@ -1207,12 +1224,12 @@ async def api_chat_stream(req: ChatRequest):
                             items = client.list_questions(
                                 session_key=f"agent:main:{sk}", status="pending")
                         except GatewayUnsupportedError as e:
-                            # 旧版本 OpenClaw（<2026.9.x）没有 question RPC：无题可轮询，
-                            # 安静退出本轮桥接（每进程只提示一次），不刷屏。
+                            # 连上了但没有 question RPC（版本判断漏网时的兜底）：熔断，安静退出。
+                            _QBRIDGE_DISABLED = True
                             _qbridge_warn_once(
                                 "unsupported",
                                 f"[question-bridge] 当前 OpenClaw 版本无 question RPC，"
-                                f"ask_user 选项卡片功能不可用（需 2026.9.x+）: {e}")
+                                f"已停用 ask_user 选项卡片桥接（需 2026.9.x+）: {e}")
                             return
                         except Exception:
                             time.sleep(2)
