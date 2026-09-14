@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback, useRef } from 'react';
 import {
   fetchAccounts, startLogin, loginStatus, mediaUrl,
   accountWhoami, logoutAccount, submitLoginSms,
+  saveCredentials, getCredentials, startMpLogin, mpLoginStatus,
 } from '../lib/api';
 import type { AccountItem, AccountWhoami } from '../lib/api';
 import { getWhoamiCache, setWhoamiCache, verifyStale } from '../lib/whoami';
@@ -51,6 +52,12 @@ export default function AccountsPage() {
   const [smsErr, setSmsErr] = useState('');
   // whoami 结果缓存到 localStorage：打开页面秒显示昵称/头像，不必每次都起浏览器校验
   const [whoami, setWhoami] = useState<Record<string, AccountWhoami | 'loading'>>(() => getWhoamiCache());
+  // 凭证式登录（微信公众号 AppID/AppSecret）
+  const [cred, setCred] = useState<{ platform: string; name: string } | null>(null);
+  const [credForm, setCredForm] = useState({ appId: '', appSecret: '', author: '' });
+  const [credBusy, setCredBusy] = useState(false);
+  const [credMsg, setCredMsg] = useState('');
+  const [credErr, setCredErr] = useState('');
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const aliveRef = useRef(true);
   const qrPlatformRef = useRef('');   // 当前登录中的平台，供 submitSms 稳定引用
@@ -91,6 +98,18 @@ export default function AccountsPage() {
 
   useEffect(() => { load(); }, [load]);
 
+  // 切回本标签页 / 窗口重新获得焦点时自动重拉账号态——登录/退出后即使漏了一次刷新，切回来也是最新的，
+  // 用户无需手动刷新页面。（登录中弹着二维码时不打扰，避免打断轮询。）
+  useEffect(() => {
+    const refresh = () => { if (document.visibilityState === 'visible' && !pollRef.current) load(); };
+    window.addEventListener('focus', refresh);
+    document.addEventListener('visibilitychange', refresh);
+    return () => {
+      window.removeEventListener('focus', refresh);
+      document.removeEventListener('visibilitychange', refresh);
+    };
+  }, [load]);
+
   const stopPoll = useCallback(() => {
     if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
   }, []);
@@ -121,8 +140,42 @@ export default function AccountsPage() {
     }
   }, [smsCode]);
 
+  // 凭证式（公众号）：打开 AppID/AppSecret 表单
+  const openCred = useCallback((a: AccountItem) => {
+    setCred({ platform: a.platform, name: a.name });
+    setCredForm({ appId: '', appSecret: '', author: '' });
+    setCredMsg(''); setCredErr('');
+    getCredentials(a.platform)
+      .then((c) => { if (aliveRef.current && c.configured) setCredMsg(`已配置：AppID ${c.appIdMasked}`); })
+      .catch(() => { /* 未配置，忽略 */ });
+  }, []);
+
+  const closeCred = useCallback(() => { setCred(null); setCredBusy(false); load(); }, [load]);
+
+  const submitCred = useCallback(async () => {
+    if (!cred) return;
+    const appId = credForm.appId.trim();
+    const appSecret = credForm.appSecret.trim();
+    if (!appId || !appSecret) { setCredErr('AppID 和 AppSecret 都要填'); return; }
+    setCredBusy(true); setCredErr(''); setCredMsg('');
+    try {
+      const r = await saveCredentials(cred.platform, { appId, appSecret, name: cred.name, author: credForm.author.trim() });
+      if (r.ok) {
+        runWhoami(cred.platform);
+        closeCred();
+      } else {
+        setCredErr(r.message || '验证未通过');
+      }
+    } catch (e) {
+      setCredErr(e instanceof Error ? e.message : '保存失败');
+    } finally {
+      setCredBusy(false);
+    }
+  }, [cred, credForm, runWhoami, closeCred]);
+
   const handleLogin = useCallback(async (a: AccountItem) => {
     if (!a.supported) return;
+    if (a.backend === 'wechat-oa') { openCred(a); return; }   // 公众号走凭证表单，不扫码
     setTerminalMsg('');
     setBusy(a.platform);
     setSmsCode(''); setSmsErr('');
@@ -134,6 +187,7 @@ export default function AccountsPage() {
         setTerminalMsg(res.message || '请在终端登录');
         return;
       }
+      if (res.mode === 'credentials') { openCred(a); return; }
       setQr({ platform: a.platform, name: a.name, state: res.state || 'starting',
               message: res.message || '', qr: res.qr || '' });   // qrTs 由随后的轮询填入
       stopPoll();
@@ -154,11 +208,48 @@ export default function AccountsPage() {
     }
   }, [stopPoll, runWhoami]);
 
+  // 公众号后台扫码登录（数据中心取数用，独立于 AppID 凭证）
+  const handleMpLogin = useCallback(async (a: AccountItem) => {
+    setBusy(a.platform + ':mp');
+    setSmsCode(''); setSmsErr('');
+    setQrNonce((n) => n + 1);
+    try {
+      const res = await startMpLogin(a.platform);
+      setQr({ platform: a.platform, name: a.name + ' · 后台取数', state: res.state || 'starting',
+              message: res.message || '', qr: res.qr || '', qrTs: res.qrTs });
+      stopPoll();
+      pollRef.current = setInterval(async () => {
+        try {
+          const s = await mpLoginStatus(a.platform);
+          setQr((prev) => prev && ({ ...prev, state: s.state, message: s.message, qr: s.qr, qrTs: s.qrTs }));
+          if (['success', 'expired', 'error'].includes(s.state)) {
+            stopPoll();
+            if (s.state === 'success') {
+              // 像快手一样“内存态立即翻”：wechat-oa 的 effLoggedIn 只看 a.loggedIn，这里直接把它乐观置 true，
+              // 卡片瞬间变「已登录」，不必等 load() 那趟网络往返（后面 load() 再对账兜底）。
+              setAccounts((list) => list.map((x) => x.platform === a.platform ? { ...x, loggedIn: true } : x));
+              setWhoami((w) => { const n = { ...w }; delete n[a.platform]; return n; });
+              setWhoamiCache(a.platform, null);
+              runWhoami(a.platform);
+              load();
+            }
+          }
+        } catch { /* 忽略单次轮询失败 */ }
+      }, 2000);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : '启动后台登录失败');
+    } finally {
+      setBusy('');
+    }
+  }, [stopPoll, runWhoami, load]);
+
   const handleLogout = useCallback(async (a: AccountItem) => {
     if (!window.confirm(`确定退出「${a.name}」的登录？登录态将被清除，下次发布需重新扫码。`)) return;
     setLogoutBusy(a.platform);
     try {
       await logoutAccount(a.platform);
+      // 内存态立即翻未登录（同登录路径），不等 load() 回来
+      setAccounts((list) => list.map((x) => x.platform === a.platform ? { ...x, loggedIn: false } : x));
       setWhoami((w) => { const n = { ...w }; delete n[a.platform]; return n; });
       setWhoamiCache(a.platform, null);
       load();
@@ -169,8 +260,10 @@ export default function AccountsPage() {
     }
   }, [load]);
 
-  // 卡片真实登录态：whoami 权威（已返回则以它为准，自愈假阳性），否则用后端 last-known
+  // 卡片真实登录态：whoami 权威（已返回则以它为准，自愈假阳性），否则用后端 last-known。
+  // 公众号(wechat-oa)例外：后端查 mp 会话即真值(快且权威)，直接用它，避免浏览器里过期的 whoami 缓存把已登录盖成未登录。
   const effLoggedIn = (a: AccountItem): boolean => {
+    if (a.backend === 'wechat-oa') return a.loggedIn;
     const w = whoami[a.platform];
     if (w && w !== 'loading') return w.loggedIn;
     return a.loggedIn;
@@ -220,14 +313,14 @@ export default function AccountsPage() {
                 </div>
               )}
               {!logged && (
-                <div className="account-card-note">{a.note ? a.note : `后端：${a.backend}`}</div>
+                <div className="account-card-note">{a.note ? a.note : `后端：${a.name}`}</div>
               )}
 
               <div style={{ display: 'flex', gap: 8, marginTop: 'auto' }}>
                 {logged ? (
                   <>
                     <button className="btn btn-sm" style={{ flex: 1 }}
-                      disabled={busy === a.platform || w === 'loading'}
+                      disabled={busy === a.platform || busy === a.platform + ':mp' || w === 'loading'}
                       onClick={() => runWhoami(a.platform)}>
                       {w === 'loading' ? '校验中…' : '校验账号'}
                     </button>
@@ -238,11 +331,12 @@ export default function AccountsPage() {
                     </button>
                   </>
                 ) : (
+                  // 公众号与其它平台统一：都走扫码登录（公众号扫的是后台会话，用于发布+数据）
                   <button
                     className={`btn btn-block ${a.supported ? 'btn-primary' : ''}`}
-                    disabled={!a.supported || busy === a.platform}
-                    onClick={() => handleLogin(a)}>
-                    {busy === a.platform ? '启动中…' : '登录'}
+                    disabled={!a.supported || busy === a.platform || busy === a.platform + ':mp'}
+                    onClick={() => (a.backend === 'wechat-oa' ? handleMpLogin(a) : handleLogin(a))}>
+                    {(busy === a.platform || busy === a.platform + ':mp') ? '启动中…' : '登录'}
                   </button>
                 )}
               </div>
@@ -299,6 +393,41 @@ export default function AccountsPage() {
             )}
             <div style={{ marginTop: 16 }}>
               <button className="btn" onClick={closeQr}>{qr.state === 'success' ? '完成' : '关闭'}</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {cred && (
+        <div className="overlay" onClick={closeCred}>
+          <div className="modal" style={{ width: 420, maxWidth: '100%' }} onClick={(e) => e.stopPropagation()}>
+            <h3 style={{ margin: '0 0 4px' }}>配置 {cred.name}</h3>
+            <div style={{ fontSize: 12.5, color: 'var(--text-secondary)', marginBottom: 14, lineHeight: 1.6 }}>
+              公众号用官方接口发布，需填开发者凭证（公众平台 → 设置与开发 → 开发接口管理）。<br />
+              ⚠️ 需把本服务器出口 IP 加入公众号「IP 白名单」，否则报 40164。文章发到<b>草稿箱</b>，群发请到 mp 后台确认。
+            </div>
+            {credMsg && <div style={{ fontSize: 12.5, color: 'var(--green)', marginBottom: 10 }}>{credMsg}</div>}
+            <label style={{ fontSize: 12, color: 'var(--text-secondary)' }}>AppID</label>
+            <input value={credForm.appId} autoFocus
+              onChange={(e) => setCredForm((f) => ({ ...f, appId: e.target.value.trim() }))}
+              placeholder="wx..." style={{ width: '100%', boxSizing: 'border-box', padding: '9px 12px',
+                margin: '4px 0 12px', border: '1px solid var(--border)', borderRadius: 8, fontSize: 14 }} />
+            <label style={{ fontSize: 12, color: 'var(--text-secondary)' }}>AppSecret</label>
+            <input value={credForm.appSecret} type="password"
+              onChange={(e) => setCredForm((f) => ({ ...f, appSecret: e.target.value.trim() }))}
+              placeholder="开发者密钥（不会回显）" style={{ width: '100%', boxSizing: 'border-box', padding: '9px 12px',
+                margin: '4px 0 12px', border: '1px solid var(--border)', borderRadius: 8, fontSize: 14 }} />
+            <label style={{ fontSize: 12, color: 'var(--text-secondary)' }}>默认作者（可选）</label>
+            <input value={credForm.author}
+              onChange={(e) => setCredForm((f) => ({ ...f, author: e.target.value }))}
+              placeholder="文章署名" style={{ width: '100%', boxSizing: 'border-box', padding: '9px 12px',
+                margin: '4px 0 4px', border: '1px solid var(--border)', borderRadius: 8, fontSize: 14 }} />
+            {credErr && <div style={{ color: 'var(--red)', fontSize: 12.5, marginTop: 8 }}>{credErr}</div>}
+            <div style={{ display: 'flex', gap: 8, marginTop: 16 }}>
+              <button className="btn btn-primary" style={{ flex: 1 }} disabled={credBusy} onClick={submitCred}>
+                {credBusy ? '验证中…' : '保存并验证'}
+              </button>
+              <button className="btn" onClick={closeCred}>关闭</button>
             </div>
           </div>
         </div>

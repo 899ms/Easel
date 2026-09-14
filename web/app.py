@@ -54,9 +54,9 @@ OPENCLAW_WORKSPACE = Path.home() / ".openclaw" / f"workspace-{OPENCLAW_PROFILE}"
 # OpenClaw 会话历史（transcript）目录：<profile 配置目录>/agents/main/sessions/<session-id>.jsonl
 OPENCLAW_SESSIONS_DIR = Path.home() / f".openclaw-{OPENCLAW_PROFILE}" / "agents" / "main" / "sessions"
 
-# 思考档位（每轮 --thinking）。OpenClaw 默认 high 会每轮产生大量 thinking 块，且这些块被存进
-# 历史时**丢了签名**，回放到内网 Bedrock 网关校验失败 → 「Session history/replay invalid」。
-# 降到 low 减少产生量；配合 _heal_openclaw_session 每轮清洗历史，彻底规避。可用 off 完全关闭。
+# 思考档位（每轮 --thinking）。实测：内网 codewiz 网关**不回传** extended-thinking 内容
+# （会话记录 & SSE 流里 thinking 命中恒为 0），故调高只增加延迟/开销、前端思考面板却永远为空。
+# 默认用 low 保证生成速度；仍可用 EASEL_THINKING_LEVEL 覆盖（若将来换了支持思考的网关再调 medium/high）。
 THINKING_LEVEL = (os.environ.get("EASEL_THINKING_LEVEL", "").strip() or "low")
 
 
@@ -108,7 +108,119 @@ LOGIN_RUNNERS: dict[str, dict] = {
     "zhihu": {"name": "知乎", "backend": "web", "wp": "zhihu", "profile": "ZhihuProfile"},
     "bilibili": {"name": "B站", "backend": "biliup"},
     "douyin": {"name": "抖音", "backend": "douyin", "profile": "DouyinProfile"},
+    # 微信公众号：扫码登录后台会话（发布+数据都走它），backend=='wechat-oa' 在各处单独分支处理。
+    "wechat-oa": {"name": "微信公众号", "backend": "wechat-oa"},
 }
+
+# ---- 微信公众号（wechat-oa）凭证式接入 ----
+# 复用 skill-wechat-publisher 的发布引擎与配置：凭证存在其 wechat-publisher.yaml，
+# 发布/取数脚本都从这里读账号。web 侧统一用账号 key "web"。
+WECHAT_SKILL_DIR = PROJECT_ROOT / "skills" / "openclaw" / "skill-wechat-publisher"
+WECHAT_SKILL_SCRIPTS = WECHAT_SKILL_DIR / "scripts"
+WECHAT_PUBLISH_SCRIPT = WECHAT_SKILL_SCRIPTS / "publish.py"
+WECHAT_CONFIG_YAML = WECHAT_SKILL_DIR / "wechat-publisher.yaml"
+WECHAT_WEB_ACCOUNT = "web"   # web 端配置写入/读取的账号 key
+
+
+def _wechat_load_yaml() -> dict:
+    """读 wechat-publisher.yaml（不存在或损坏则返回空 dict）。"""
+    if not WECHAT_CONFIG_YAML.is_file():
+        return {}
+    try:
+        import yaml
+        data = yaml.safe_load(WECHAT_CONFIG_YAML.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _wechat_web_account() -> dict:
+    """返回 web 端配置的公众号账号（accounts.web），无则空 dict。"""
+    cfg = _wechat_load_yaml()
+    accts = cfg.get("accounts") if isinstance(cfg.get("accounts"), dict) else {}
+    acc = accts.get(WECHAT_WEB_ACCOUNT)
+    return acc if isinstance(acc, dict) else {}
+
+
+def _wechat_has_credentials() -> bool:
+    acc = _wechat_web_account()
+    return bool(acc.get("app_id") and acc.get("app_secret"))
+
+
+def _wechat_save_credentials(app_id: str, app_secret: str, name: str = "", author: str = "") -> None:
+    """把 AppID/AppSecret 写入 wechat-publisher.yaml 的 accounts.web（原子写，保留其它账号）。"""
+    import yaml
+    cfg = _wechat_load_yaml()
+    if not isinstance(cfg.get("accounts"), dict):
+        cfg["accounts"] = {}
+    acc = cfg["accounts"].get(WECHAT_WEB_ACCOUNT)
+    if not isinstance(acc, dict):
+        acc = {}
+    acc["name"] = name or acc.get("name") or "微信公众号"
+    acc["app_id"] = app_id
+    acc["app_secret"] = app_secret
+    if author:
+        acc["author"] = author
+    acc.setdefault("author", "")
+    cfg["accounts"][WECHAT_WEB_ACCOUNT] = acc
+    # web 账号存在即设为默认，方便 CLI 直接用
+    cfg.setdefault("default", WECHAT_WEB_ACCOUNT)
+    WECHAT_CONFIG_YAML.parent.mkdir(parents=True, exist_ok=True)
+    tmp = WECHAT_CONFIG_YAML.with_suffix(".yaml.tmp")
+    tmp.write_text(yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    os.replace(tmp, WECHAT_CONFIG_YAML)
+
+
+def _wechat_clear_credentials() -> None:
+    """删除 accounts.web 及其 token 缓存。"""
+    import yaml
+    cfg = _wechat_load_yaml()
+    accts = cfg.get("accounts")
+    if isinstance(accts, dict) and WECHAT_WEB_ACCOUNT in accts:
+        accts.pop(WECHAT_WEB_ACCOUNT, None)
+        if cfg.get("default") == WECHAT_WEB_ACCOUNT:
+            cfg["default"] = next(iter(accts), "") if accts else ""
+        try:
+            tmp = WECHAT_CONFIG_YAML.with_suffix(".yaml.tmp")
+            tmp.write_text(yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False), encoding="utf-8")
+            os.replace(tmp, WECHAT_CONFIG_YAML)
+        except Exception:
+            pass
+    for cache in (WECHAT_SKILL_SCRIPTS / f".token_cache_{WECHAT_WEB_ACCOUNT}.json",
+                  WECHAT_SKILL_SCRIPTS / ".token_cache.json"):
+        try:
+            cache.unlink()
+        except OSError:
+            pass
+
+
+def _wechat_verify_token() -> tuple[bool, str]:
+    """用当前 accounts.web 凭证调官方 token 接口验证。返回 (ok, message)。
+    在子进程里跑，避免把 skill 的 import 副作用带进 web 进程。"""
+    code = (
+        "import sys; sys.path.insert(0, %r)\n"
+        "from config import set_account\n"
+        "from wechat_token import get_access_token\n"
+        "set_account(%r)\n"
+        "try:\n"
+        "    t = get_access_token(force_refresh=True)\n"
+        "    print('OK' if t else 'EMPTY')\n"
+        "except Exception as e:\n"
+        "    print('ERR:' + str(e))\n"
+    ) % (str(WECHAT_SKILL_SCRIPTS), WECHAT_WEB_ACCOUNT)
+    try:
+        proc = subprocess.run([sys.executable, "-c", code], cwd=str(WECHAT_SKILL_SCRIPTS),
+                              env=_wechat_env(), capture_output=True, text=True, timeout=30)
+    except subprocess.TimeoutExpired:
+        return False, "验证超时（网络或 IP 白名单问题）"
+    out = (proc.stdout or "").strip().splitlines()
+    last = out[-1] if out else ""
+    if last == "OK":
+        return True, ""
+    if last.startswith("ERR:"):
+        return False, last[4:].strip()[:200]
+    err = (proc.stderr or "").strip().splitlines()[-1:] or ["验证失败"]
+    return False, err[0][:200]
 
 
 def _k(env, label, required=True, secret=True, aliases=None):
@@ -319,6 +431,31 @@ def _publish_env() -> dict[str, str]:
     脚本时不经过这里，flag 未设 → 脚本自动记录（见 calendar_ops.record_publish）。"""
     env = _proxy_env()
     env['EASEL_CALENDAR_AUTORECORD'] = '0'
+    return env
+
+
+def _wechat_env() -> dict[str, str]:
+    """公众号 API 子进程 env，决定微信 API 从哪个 IP 出网（公众号白名单要求固定出口 IP）。
+
+    两种模式：
+    - 设了 WECHAT_EGRESS_PROXY（如反向隧道到你本机/固定 IP 中转）→ 让微信 API **走这个代理**出网，
+      微信看到的是该代理的公网 IP，白名单加它即可。其它外网仍走公司代理。
+    - 未设 → 微信 API 走**直连**（api.weixin.qq.com 进 no_proxy）。注意本机直连出口也是共享 NAT
+      轮询池（见 WECHAT_OA_INTEGRATION.md §4），直连仅在出口 IP 恰好固定的机器上可靠。"""
+    env = _publish_env()
+    wx_hosts = ("api.weixin.qq.com", "mp.weixin.qq.com")
+    egress = os.environ.get("WECHAT_EGRESS_PROXY", "").strip()
+    if egress:
+        # 微信 API 走指定固定出口代理；从 no_proxy 里去掉微信域名，确保不被旁路成直连。
+        env["http_proxy"] = env["https_proxy"] = egress
+        env["HTTP_PROXY"] = env["HTTPS_PROXY"] = egress
+        kept = [h for h in env.get("no_proxy", "").split(",") if h and not any(w in h for w in wx_hosts)]
+        env["no_proxy"] = ",".join(kept)
+        env["NO_PROXY"] = env["no_proxy"]
+    else:
+        existing = env.get("no_proxy", "")
+        env["no_proxy"] = (existing + "," + ",".join(wx_hosts)) if existing else ",".join(wx_hosts)
+        env["NO_PROXY"] = env["no_proxy"]
     return env
 
 
@@ -1713,6 +1850,14 @@ def _account_logged_in(platform: str, cfg: dict) -> bool:
         return False
     if backend == 'biliup':
         return (PROJECT_ROOT / 'cookies.json').is_file()
+    if backend == 'wechat-oa':
+        # 发布+数据都走「后台会话」→ 以 mp 后台登录成功为准；AppID 凭证作为兜底（旧配置）
+        try:
+            if _mp_login_status().get('state') == 'success':
+                return True
+        except Exception:
+            pass
+        return _wechat_has_credentials()
     st = LOGIN_DIR / f'{platform}.json'
     if st.is_file():
         try:
@@ -1772,6 +1917,10 @@ async def api_login_start(platform: str):
     backend = cfg['backend']
     if backend == 'unsupported':
         raise HTTPException(400, f"{cfg['name']} 暂不可用：{cfg.get('note', '')}")
+    if backend == 'wechat-oa':
+        # 公众号不走扫码：前端应改用凭证表单提交到 /api/accounts/{platform}/credentials。
+        return {'mode': 'credentials', 'configured': _wechat_has_credentials(),
+                'message': '微信公众号请填写 AppID / AppSecret'}
     LOGIN_DIR.mkdir(parents=True, exist_ok=True)
     qr = LOGIN_DIR / f'{platform}.png'
     status = LOGIN_DIR / f'{platform}.json'
@@ -1854,6 +2003,114 @@ async def api_login_sms(platform: str, req: SmsCodeRequest):
     return {'ok': True}
 
 
+class WechatCredentials(BaseModel):
+    appId: str = ''
+    appSecret: str = ''
+    name: str = ''
+    author: str = ''
+
+
+@app.get("/api/accounts/{platform}/credentials")
+async def api_get_credentials(platform: str):
+    """读取凭证式平台（目前仅公众号）的已配置状态（AppID 脱敏，AppSecret 不回传）。"""
+    cfg = LOGIN_RUNNERS.get(platform)
+    if not cfg or cfg.get('backend') != 'wechat-oa':
+        raise HTTPException(404, '该平台不使用凭证登录')
+    acc = _wechat_web_account()
+    app_id = acc.get('app_id', '') or ''
+    return {
+        'configured': bool(app_id and acc.get('app_secret')),
+        'appIdMasked': (app_id[:6] + '***' + app_id[-4:]) if len(app_id) > 10 else ('***' if app_id else ''),
+        'name': acc.get('name', '') or '',
+        'author': acc.get('author', '') or '',
+    }
+
+
+@app.post("/api/accounts/{platform}/credentials")
+async def api_save_credentials(platform: str, req: WechatCredentials):
+    """保存凭证式平台（公众号）的 AppID/AppSecret，写入 skill 配置并调官方接口验证。"""
+    cfg = LOGIN_RUNNERS.get(platform)
+    if not cfg or cfg.get('backend') != 'wechat-oa':
+        raise HTTPException(404, '该平台不使用凭证登录')
+    app_id = (req.appId or '').strip()
+    app_secret = (req.appSecret or '').strip()
+    if not app_id or not app_secret:
+        raise HTTPException(400, 'AppID 和 AppSecret 都不能为空')
+    _wechat_save_credentials(app_id, app_secret, name=req.name.strip(), author=req.author.strip())
+    ok, msg = _wechat_verify_token()
+    with _WHOAMI_LOCK:
+        _WHOAMI_CACHE.pop(platform, None)
+    if ok:
+        _write_login_marker(platform, 'success', req.name.strip() or '微信公众号')
+        return {'ok': True, 'message': '公众号凭证已保存并验证通过'}
+    # 校验失败：凭证已存（下次改正后可直接重试），但明确告知失败原因（常见 40164 IP 白名单 / 40125 密钥错误）
+    return {'ok': False, 'message': f'凭证已保存但验证未通过：{msg}。若是 40164 请把服务器出口 IP 加入公众号 IP 白名单。'}
+
+
+def _mp_login_status() -> dict:
+    """读公众号后台(mp)登录状态 + 二维码（文件由 weixin_mp_stats.py login 写）。"""
+    st = LOGIN_DIR / "wechat-oa-mp.json"
+    data = {"state": "unknown", "message": ""}
+    if st.is_file():
+        try:
+            d = json.loads(st.read_text(encoding="utf-8"))
+            data = {"state": d.get("state", "unknown"), "message": d.get("message", "")}
+        except Exception:
+            pass
+    proc = LOGIN_PROCESSES.get("wechat-oa-mp")
+    if data["state"] in ("unknown", "starting") and proc is not None and proc.poll() is not None:
+        data = {"state": "error", "message": f"登录程序退出（码 {proc.poll()}），见 outputs/_login/wechat-oa-mp.log"}
+    qr = LOGIN_DIR / "wechat-oa-mp.png"
+    if qr.is_file():
+        data["qr"] = "_login/wechat-oa-mp.png"
+        try:
+            data["qrTs"] = int(qr.stat().st_mtime)
+        except OSError:
+            data["qrTs"] = 0
+    else:
+        data["qr"] = ""
+        data["qrTs"] = 0
+    return data
+
+
+@app.post("/api/accounts/{platform}/mp-login")
+async def api_mp_login_start(platform: str):
+    """启动「公众号后台」扫码登录（数据中心取数用，管理员级会话，独立于 AppID 凭证）。
+    默认直连起 Playwright 出二维码；受限网络可设 EASEL_PROXY / https_proxy 走正向代理。"""
+    cfg = LOGIN_RUNNERS.get(platform)
+    if not cfg or cfg.get("backend") != "wechat-oa":
+        raise HTTPException(404, "该平台不使用公众号后台登录")
+    LOGIN_DIR.mkdir(parents=True, exist_ok=True)
+    for f in (LOGIN_DIR / "wechat-oa-mp.png", LOGIN_DIR / "wechat-oa-mp.json"):
+        try:
+            f.unlink()
+        except OSError:
+            pass
+    wx_proxy = os.environ.get("EASEL_PROXY") or os.environ.get("https_proxy") or ""
+    cmd = [sys.executable, str(SHARED_SCRIPTS / "weixin_mp_stats.py"), "login",
+           "--proxy", wx_proxy, "--qr-out", str(LOGIN_DIR / "wechat-oa-mp.png"),
+           "--status-file", str(LOGIN_DIR / "wechat-oa-mp.json"), "--timeout", "240"]
+    log_file = (LOGIN_DIR / "wechat-oa-mp.log").open("a", encoding="utf-8")
+    proc = subprocess.Popen(cmd, cwd=str(PROJECT_ROOT), env=_proxy_env(),
+                            stdout=log_file, stderr=subprocess.STDOUT)
+    log_file.close()
+    LOGIN_PROCESSES["wechat-oa-mp"] = proc
+    for _ in range(60):
+        await asyncio.sleep(0.5)
+        s = _mp_login_status()
+        if s["qr"] or s["state"] in ("qr_ready", "success", "error", "expired"):
+            return {"mode": "qr", **s}
+    return {"mode": "qr", **_mp_login_status()}
+
+
+@app.get("/api/accounts/{platform}/mp-login/status")
+async def api_mp_login_status(platform: str):
+    cfg = LOGIN_RUNNERS.get(platform)
+    if not cfg or cfg.get("backend") != "wechat-oa":
+        raise HTTPException(404, "该平台不使用公众号后台登录")
+    return {"mode": "qr", **_mp_login_status()}
+
+
 @app.get("/api/accounts/{platform}/whoami")
 async def api_account_whoami(platform: str):
     """真校验登录态 + 读昵称/头像（起 headless 浏览器，数秒）。前端开页后台调用以自愈假阳性。
@@ -1864,6 +2121,11 @@ async def api_account_whoami(platform: str):
     backend = cfg['backend']
     if backend == 'unsupported':
         return {'loggedIn': False, 'name': '', 'avatar': ''}
+    if backend == 'wechat-oa':
+        # 不起浏览器：以 mp 后台会话/AppID 配置判断（见 _account_logged_in），名字取配置账号名
+        acc = _wechat_web_account()
+        return {'loggedIn': _account_logged_in(platform, cfg),
+                'name': acc.get('name', '') or '微信公众号', 'avatar': ''}
     # 命中未过期缓存直接返回
     with _WHOAMI_LOCK:
         hit = _WHOAMI_CACHE.get(platform)
@@ -1923,6 +2185,35 @@ async def api_logout(platform: str):
     if not cfg:
         raise HTTPException(404, '未知平台')
     deleted = []
+    if cfg['backend'] == 'wechat-oa':
+        # 1) 清 AppID 凭证（旧配置兜底）
+        _wechat_clear_credentials()
+        deleted.append('wechat-publisher.yaml:accounts.web')
+        # 2) 停掉可能仍在跑的后台登录进程（避免它又写回 success 标记）
+        proc = LOGIN_PROCESSES.pop('wechat-oa-mp', None)
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+        # 3) 删 AppID 标记 + mp 后台会话标记/二维码/日志（登录态判定看的就是 wechat-oa-mp.json）
+        for name in (f'{platform}.json', f'{platform}.png',
+                     'wechat-oa-mp.json', 'wechat-oa-mp.png', 'wechat-oa-mp.log'):
+            f = LOGIN_DIR / name
+            try:
+                if f.is_file():
+                    f.unlink()
+                    deleted.append(f.name)
+            except OSError:
+                pass
+        # 4) 删 mp 后台浏览器持久化会话（真正退出登录）
+        mpdir = (BROWSER_PROFILES / 'WeixinMpProfile').resolve()
+        if BROWSER_PROFILES.resolve() in mpdir.parents and mpdir.is_dir():
+            shutil.rmtree(mpdir, ignore_errors=True)
+            deleted.append('WeixinMpProfile')
+        with _WHOAMI_LOCK:
+            _WHOAMI_CACHE.pop(platform, None)
+        return {'ok': True, 'deleted': deleted}
     prof_name = cfg.get('profile')
     if prof_name:
         pdir = (BROWSER_PROFILES / prof_name).resolve()
@@ -1947,8 +2238,9 @@ async def api_logout(platform: str):
     return {'ok': True, 'deleted': deleted}
 
 
-# 归因层：可抓创作数据的平台（走 Playwright 登录态；bilibili 用 biliup cookies 不在此列）
-ANALYTICS_PLATFORMS = {"xiaohongshu", "douyin", "kuaishou", "zhihu", "weixin-channels", "bilibili"}
+# 归因层：可抓创作数据的平台（多数走 Playwright 登录态；bilibili 用 biliup cookies、
+# wechat-oa 用官方 datacube API，均不起浏览器）
+ANALYTICS_PLATFORMS = {"xiaohongshu", "douyin", "kuaishou", "zhihu", "weixin-channels", "bilibili", "wechat-oa"}
 
 
 @app.get("/api/analytics/platforms")
@@ -1966,15 +2258,23 @@ async def api_analytics(platform: str):
     """抓取某平台已登录账号的创作数据（粉丝/获赞/作品 + 与上次快照的增长）。起 headless 浏览器，数秒。"""
     if platform not in ANALYTICS_PLATFORMS:
         raise HTTPException(404, "该平台暂不支持数据抓取")
-    # B站用 cookie 调 API（无浏览器 profile），单独走 bili_login stats；其余走 account_stats（Playwright）
+    # B站用 cookie 调 API、公众号用官方 datacube API（均无浏览器 profile），单独分支；其余走 account_stats（Playwright）
     if platform == "bilibili":
         cmd = [sys.executable, str(SHARED_SCRIPTS / "bili_login.py"), "stats",
                "--cookie", str(PROJECT_ROOT / "cookies.json")]
+    elif platform == "wechat-oa":
+        # 公众号数据走「后台网页端」(mp.weixin.qq.com 管理员会话 + Playwright 拦截数据 XHR)：
+        # 开发者 datacube 接口需认证+群发+接口权限，多数号取不到；后台端有登录态即可看到发表记录/数据。
+        # 需先扫码登录 mp 后台（weixin_mp_stats.py login）；默认直连，受限网络才需 EASEL_PROXY/https_proxy。
+        wx_proxy = os.environ.get("EASEL_PROXY") or os.environ.get("https_proxy") or ""
+        cmd = [sys.executable, str(SHARED_SCRIPTS / "weixin_mp_stats.py"), "stats",
+               "--proxy", wx_proxy, "--count", "20"]
     else:
         # 代理策略由 account_stats.py 按平台自定（xhs 直连、其它走 env），后端照常传 _proxy_env
         cmd = [sys.executable, str(SHARED_SCRIPTS / "account_stats.py"), "fetch", "--platform", platform]
+    ana_env = _proxy_env()
     try:
-        proc = await asyncio.to_thread(subprocess.run, cmd, cwd=str(PROJECT_ROOT), env=_proxy_env(),
+        proc = await asyncio.to_thread(subprocess.run, cmd, cwd=str(PROJECT_ROOT), env=ana_env,
                                        capture_output=True, text=True, timeout=180)
     except subprocess.TimeoutExpired:
         raise HTTPException(504, "抓取超时（浏览器起不来或网络慢）")
@@ -2152,6 +2452,35 @@ async def api_publish(platform: str, req: PublishRequest):
         code_file = PUBLISH_DIR / 'douyin.code'
         cmd += ['--status-file', str(status_file), '--sms-code-file', str(code_file)]
         return _start_async_publish(platform, cmd, title, req.body, cfg, status_file, code_file)
+    elif platform == 'wechat-oa':
+        # 微信公众号：走「后台会话」发布（免 AppID/AppSecret、免 IP 白名单）。
+        # 正文 MD → 公众号 HTML（skill 排版器）→ 会话建草稿（weixin_mp_stats.py publish，内嵌图传 mp CDN）。
+        if _mp_login_status().get('state') != 'success':
+            raise HTTPException(400, '公众号后台未登录：请先在账号页点「登录公众号后台」扫码')
+        if not imgs:
+            raise HTTPException(400, '公众号文章需要一张封面图，请附带至少一张图片')
+        if vids:
+            raise HTTPException(400, '公众号发图文文章，请附带封面/正文图片而非视频')
+        cover = imgs[0]
+        PUBLISH_DIR.mkdir(parents=True, exist_ok=True)
+        stamp = uuid.uuid4().hex[:12]
+        md_path = PUBLISH_DIR / f'wechat-oa-{stamp}.md'
+        html_path = PUBLISH_DIR / f'wechat-oa-{stamp}.html'
+        body_md = req.body or ''
+        extra_imgs = imgs[1:]
+        if extra_imgs:
+            body_md += "\n\n" + "\n\n".join(f'![]({p})' for p in extra_imgs)
+        md_path.write_text(f"# {title}\n\n{body_md}\n", encoding='utf-8')
+        conv = subprocess.run([py, str(WECHAT_SKILL_SCRIPTS / 'html_converter.py'),
+                               str(md_path), '-o', str(html_path)],
+                              cwd=str(PROJECT_ROOT), env=_proxy_env(),
+                              capture_output=True, text=True, timeout=60)
+        if conv.returncode != 0 or not html_path.is_file():
+            raise HTTPException(500, f"排版失败：{(conv.stderr or conv.stdout or '')[-200:]}")
+        wx_proxy = os.environ.get('EASEL_PROXY') or os.environ.get('https_proxy') or ''
+        cmd = [py, str(SHARED_SCRIPTS / 'weixin_mp_stats.py'), 'publish', '--proxy', wx_proxy,
+               '--html', str(html_path), '--cover', cover, '--title', title,
+               '--digest', (req.body or '').strip()[:100], '--author', '']
     else:
         cmd = [py, str(SHARED_SCRIPTS / 'web_publisher.py'), 'publish',
                '--platform', cfg['wp'], '--title', title, '--desc', req.body,
@@ -2159,8 +2488,10 @@ async def api_publish(platform: str, req: PublishRequest):
         media = vids[0] if vids else (imgs[0] if imgs else None)
         if media:
             cmd += ['--media', media]
+    # 公众号走后台会话（Playwright，脚本自带 --proxy，默认直连）；其余平台走 _publish_env
+    pub_env = _proxy_env() if platform == 'wechat-oa' else _publish_env()
     try:
-        proc = await asyncio.to_thread(subprocess.run, cmd, cwd=str(PROJECT_ROOT), env=_publish_env(),
+        proc = await asyncio.to_thread(subprocess.run, cmd, cwd=str(PROJECT_ROOT), env=pub_env,
                                        capture_output=True, text=True, timeout=600)
     except subprocess.TimeoutExpired:
         raise HTTPException(504, '发布超时（媒体处理慢或流程卡住）')
