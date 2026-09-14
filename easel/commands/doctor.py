@@ -10,6 +10,8 @@ import urllib.request
 import urllib.error
 from pathlib import Path
 
+from easel.openclaw_cmd import openclaw_base_cmd
+
 # 项目根目录（Easel/）
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
@@ -59,8 +61,12 @@ def _node_version_ok(strict: bool) -> bool:
 def _openclaw_version() -> tuple[int, int, int] | None:
     """解析 `openclaw --version`，返回 (year, month, patch)；无法确定时返回 None。"""
     try:
+        # 不能裸调 ["openclaw", ...]：Windows 上它是 npm 装的 `.cmd` shim，
+        # CreateProcess 不按 PATHEXT 解析、裸名找不到文件 → FileNotFoundError
+        # → 版本被误判「未知」。统一走 openclaw_cmd 的解析（Windows 上解析为
+        # node + openclaw.mjs，Unix 上为直接可执行路径）。
         result = subprocess.run(
-            ["openclaw", "--version"],
+            openclaw_base_cmd() + ["--version"],
             capture_output=True, text=True, timeout=10,
         )
         if result.returncode != 0:
