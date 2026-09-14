@@ -2,6 +2,26 @@
 
 All notable changes to Easel are documented in this file.
 
+## [0.1.1] - 2026-09-15
+
+### Added
+
+- Added WeChat Official Account (公众号) support: article publishing, Data Center metrics, and account management via a background QR-scan session.
+- Added an optional vendored typesetting Skill (`gzh-design`, AGPL-3.0), bringing the Skill count to 113.
+
+### Improved
+
+- Improved the workbench **创作数据** panel: Bilibili and Douyin now populate "近 7 日 · 环比" (7-day metrics with week-over-week change) and "最近作品" (recent works).
+  - Bilibili reads the creator overview API for play/like/comment/favorite/share/follower deltas, and lists recent uploads (title/link/cover/stats).
+  - Douyin parses the real "近 7 日" labels with a section anchor to avoid mis-reading the "最新作品" card, handles the "较前7日±X" delta format, hardens polling stability, and scrapes recent works from the content-manage page.
+
+### Fixed
+
+- Fixed OpenClaw version detection in `easel doctor` on Windows (the `.cmd` shim cannot be invoked bare).
+- Fixed cross-platform gateway/launcher robustness and Xiaohongshu login navigation races.
+
+[0.1.1]: https://github.com/ZJU-REAL/Easel/releases/tag/v0.1.1
+
 ## [0.1.0] - 2026-08-31
 
 Easel's first public release, jointly developed by REAL Lab and OpenDCAI Lab.
