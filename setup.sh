@@ -208,7 +208,21 @@ if command -v openclaw >/dev/null 2>&1; then
 else
     info "安装 OpenClaw..."
     npm install -g openclaw@latest --loglevel warn 2>&1 | tail -1
+    # npm 全局 bin 目录未必在当前 shell 的 PATH 上：macOS Homebrew 的 Node 会把全局包装到
+    # $(npm prefix -g)/bin（如 /opt/homebrew/Cellar/node/<ver>/bin），而 /opt/homebrew/bin 里
+    # 并没有 openclaw 链接。此时 command -v 拿到空值，后面 $OPENCLAW_BIN --version 会直接崩。
+    # 先把 npm 全局 bin 补进 PATH 再检测。
+    if ! command -v openclaw >/dev/null 2>&1; then
+        NPM_GLOBAL_BIN="$(npm prefix -g 2>/dev/null)/bin"
+        if [ -x "$NPM_GLOBAL_BIN/openclaw" ]; then
+            export PATH="$NPM_GLOBAL_BIN:$PATH"
+        fi
+    fi
     OPENCLAW_BIN="$(command -v openclaw)"
+    if [ -z "$OPENCLAW_BIN" ]; then
+        echo "OpenClaw 安装后仍未在 PATH 中找到。请把 npm 全局 bin 目录（$(npm prefix -g 2>/dev/null)/bin）加入 PATH 后重新运行 setup.sh（幂等，会跳过已装部分）。" >&2
+        exit 1
+    fi
     ok "OpenClaw 已安装：$($OPENCLAW_BIN --version 2>&1 | head -1)"
 fi
 OC="$OPENCLAW_BIN --profile $PROFILE"
