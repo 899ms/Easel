@@ -127,7 +127,7 @@ if command -v python3 >/dev/null 2>&1; then
     if [ "$PYTHON_OK" -eq 1 ]; then
         ok "Python $(python3 --version 2>&1 | awk '{print $2}')"
     else
-        echo "Python 版本过低：检测到 $PYTHON_VER，需要 Python 3.10+。" >&2
+        echo "Python 版本过低：检测到 ${PYTHON_VER}，需要 Python 3.10+。" >&2
         exit 1
     fi
 else
