@@ -328,16 +328,40 @@ def _parse_analytics(cap, result):
 
 
 def _editor_ctx(page, token):
-    """打开图文编辑器页，抽取上传所需的 ticket / user_name。"""
+    """打开图文编辑器页，抽取上传所需的 ticket / user_name。
+
+    ticket / user_name 就在**服务端渲染的 HTML** 里，因此优先用纯 HTTP 抓取（page.request.get），
+    不经浏览器渲染——这样就不依赖编辑器 Vue 界面的 JS/CSS（res.wx.qq.com CDN）能否加载。
+    实测该 CDN 偶发 TLS 握手卡死时，page.goto()+page.content() 会停在只有 <head> 的空壳、
+    读不到 ticket（误报“编辑器改版 / 未取到 ticket”）；纯 HTTP 抓服务端 HTML 不受此影响。
+    纯 HTTP 少数情况下没拿到时，再退回浏览器渲染兜底。"""
     edit = (f"https://mp.weixin.qq.com/cgi-bin/appmsg?t=media/appmsg_edit_v2&action=edit&isNew=1"
             f"&type=77&createType=0&token={token}&lang=zh_CN")
-    page.goto(edit, wait_until="commit", timeout=60000)
-    page.wait_for_timeout(3500)
-    html = page.content()
-    def grab(key):
+
+    def grab(key, html):
         m = re.search(rf'{key}["\']?\s*[:=]\s*["\']?([\w%.-]+)', html)
         return m.group(1) if m else ""
-    return {"ticket": grab("ticket"), "user_name": grab("user_name"), "nick_name": grab("nick_name")}
+
+    # 1) 优先纯 HTTP 抓服务端 HTML（不渲染、不加载 res.wx.qq.com 资源）
+    html = ""
+    try:
+        r = page.request.get(edit, timeout=30000)
+        if r.ok:
+            html = r.text()
+    except Exception:
+        html = ""
+
+    # 2) 纯 HTTP 没拿到 ticket（少见）→ 退回浏览器渲染再取一次
+    if not grab("ticket", html):
+        try:
+            page.goto(edit, wait_until="commit", timeout=60000)
+            page.wait_for_timeout(3500)
+            html = page.content()
+        except Exception:
+            pass
+
+    return {"ticket": grab("ticket", html), "user_name": grab("user_name", html),
+            "nick_name": grab("nick_name", html)}
 
 
 def cmd_publish(a):
