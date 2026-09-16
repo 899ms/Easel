@@ -19,6 +19,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
@@ -324,7 +325,14 @@ IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg"}
 VIDEO_EXTS = {".mp4", ".mov", ".webm", ".m4v"}
 AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac"}
 
-app = FastAPI(title="Easel", docs_url=None, redoc_url=None)
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    """应用生命周期：关机时回收公众号扫码进程（替代已弃用的 on_event）。"""
+    yield
+    _stop_mp_login_on_shutdown()
+
+
+app = FastAPI(title="Easel", docs_url=None, redoc_url=None, lifespan=_lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
@@ -2118,7 +2126,6 @@ def _mp_login_status() -> dict:
     return data
 
 
-@app.on_event("shutdown")
 def _stop_mp_login_on_shutdown() -> None:
     """正常重启 Web 时回收扫码进程，避免它继续写入下一次登录的状态。"""
     proc = LOGIN_PROCESSES.pop("wechat-oa-mp", None)
