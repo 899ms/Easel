@@ -334,6 +334,31 @@ def test_attachment_context_rejects_tampered_reference(tmp_path, monkeypatch):
     assert exc.value.status_code == 403
 
 
+# ---- 跨平台：文本落盘必须显式 encoding（否则 Windows cp1252/gbk 写中文报错、读回丢内容）----
+
+@pytest.mark.parametrize("rel", ["web/app.py", "easel/persona.py", "easel/commands/skill.py"])
+def test_text_io_always_pins_utf8_encoding(rel):
+    """read_text/write_text 若不显式指定 encoding，Windows 默认非 UTF-8：
+    写中文抛 UnicodeEncodeError（落不了盘），读回抛 UnicodeDecodeError（像丢了数据）。
+    这些持久化路径在 Linux CI 恰好用 UTF-8 默认值而侥幸通过，此守卫在任何平台都能拦住回归。"""
+    import ast as _ast
+
+    source = (PROJECT_ROOT / rel).read_text(encoding="utf-8")
+    offenders = []
+    for node in _ast.walk(_ast.parse(source)):
+        if not (isinstance(node, _ast.Call) and isinstance(node.func, _ast.Attribute)):
+            continue
+        if node.func.attr not in ("read_text", "write_text"):
+            continue
+        has_kw = any(kw.arg == "encoding" for kw in node.keywords)
+        # 位置参：read_text(encoding) 第 1 个、write_text(data, encoding) 第 2 个
+        min_pos = 1 if node.func.attr == "read_text" else 2
+        has_pos = len(node.args) >= min_pos
+        if not (has_kw or has_pos):
+            offenders.append(f"{rel}:{node.lineno} {node.func.attr}() 缺少 encoding")
+    assert not offenders, "以下文本落盘未固定 encoding：\n" + "\n".join(offenders)
+
+
 # ---- Web: 路径穿越防护 ----
 
 def test_safe_output_path_blocks_traversal():
