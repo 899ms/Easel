@@ -1878,6 +1878,43 @@ async def api_upload(
     return {"ok": True, "files": saved}
 
 
+@app.get("/api/upload/limits")
+async def api_upload_limits():
+    """当前上传上限（MB）——前端在文件超限时据此切换到本地复制通道。"""
+    return {"ok": True, "max_mb": MAX_UPLOAD_MB}
+
+
+@app.post("/api/upload/local")
+async def api_upload_local(
+    files: list[UploadFile] = File(...),
+    sessionId: str = Form(...),
+):
+    """超过上传上限的文件复制通道：1MB 分块流式落盘（不整读进内存）、无大小上限；
+    产出与 /api/upload 同构的附件引用（id/name/path），附件校验与清单链路零改动。"""
+    scope = _attachment_scope(sessionId)
+    batch = time.strftime('%Y%m%d-') + uuid.uuid4().hex[:6]
+    dest = OUTPUTS_DIR / "_inbox" / scope / batch
+    dest.mkdir(parents=True, exist_ok=True)
+    saved = []
+    for f in files:
+        name = Path(f.filename or "file").name
+        ext = Path(name).suffix.lower()
+        if ext not in UPLOAD_EXTS:
+            raise HTTPException(400, f'不支持的文件类型：{ext or name}')
+        target = _unique_upload_path(dest, name)
+        with open(target, 'wb') as out:
+            while True:
+                chunk = await f.read(1024 * 1024)
+                if not chunk:
+                    break
+                out.write(chunk)
+        rel = f"_inbox/{scope}/{batch}/{target.name}"
+        saved.append({"id": _attachment_id(scope, rel), "name": target.name, "path": rel})
+    if not saved:
+        raise HTTPException(400, '没有文件')
+    return {"ok": True, "files": saved}
+
+
 def _write_login_marker(platform: str, state: str, message: str = '') -> None:
     """回写登录标记 outputs/_login/<平台>.json（与 login_state.write_status 同格式，原子写）。
     whoami 真校验确认已登录后调用 → _account_logged_in 的快速路径此后自愈并持久。"""
