@@ -347,6 +347,16 @@ export async function uploadFiles(files: File[], sessionId: string): Promise<Upl
   return r.files;
 }
 
+/** 超限文件复制通道：返回与 uploadFiles 同构的附件引用。 */
+export interface AdoptedFile { id: string; name: string; path: string; }
+export async function adoptOversize(files: File[], sessionId: string): Promise<AdoptedFile[]> {
+  const fd = new FormData();
+  for (const f of files) fd.append('files', f);
+  fd.append('sessionId', sessionId);
+  const r = await request<{ ok: boolean; files: AdoptedFile[] }>('/api/upload/local', { method: 'POST', body: fd });
+  return r.files;
+}
+
 export function deleteSession(sessionKey: string): Promise<{ deleted: boolean }> {
   return request<{ deleted: boolean }>(`/api/session/${encodeURIComponent(sessionKey)}`, {
     method: 'DELETE',
