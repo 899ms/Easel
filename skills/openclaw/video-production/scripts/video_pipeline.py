@@ -40,6 +40,9 @@ def find_sdk(args) -> Path:
         cands.append(args.sdk)
     if os.environ.get("VIDEO_PIPELINE_SDK"):
         cands.append(os.environ["VIDEO_PIPELINE_SDK"])
+    # 内置 SDK（随 Easel 进仓，默认自包含）：本脚本在 .../video-production/scripts/，
+    # SDK 在 .../video-production/vendor/video-pipeline-sdk/。作 --sdk/env 之后的首选。
+    cands.append(str(Path(__file__).resolve().parent.parent / "vendor" / "video-pipeline-sdk"))
     cands += [
         str(Path.cwd() / "video-pipeline-sdk"),
         str(Path.home() / "video-pipeline-sdk"),
@@ -150,6 +153,22 @@ def post_deliver(base: Path, rd: Path):
 
 # ---------------------------------------------------------------- commands --
 
+def report_transcription_tiers(sdk: Path) -> None:
+    """打印三级转录策略可用性（Easel 内置改造）。"""
+    print("转录三级策略（优先级从上到下）：")
+    print("  tier1 现成稿  ：start 时给 --transcript（.srt/.vtt 自动转段级，.json 直接用）— 有则最省")
+    key_on = bool(os.environ.get("SILICONFLOW_API_KEY", "").strip())
+    model = os.environ.get("SILICONFLOW_ASR_MODEL", "XingChenAGI/XingChenGSR-V1.0")
+    print(f"  tier2 云端API ：SILICONFLOW_API_KEY {'已配置 ✓' if key_on else '未配置（export 后启用）'}"
+          f" · model={model}")
+    try:
+        import faster_whisper  # noqa: F401
+        fw = "已装 ✓"
+    except ImportError:
+        fw = "未装"
+    print(f"  tier3 本地whisper：faster-whisper {fw}（兜底，首次需下 large-v3 约 3GB）")
+
+
 def cmd_doctor(args) -> int:
     sdk = find_sdk(args)
     base = find_base(args)
@@ -159,6 +178,9 @@ def cmd_doctor(args) -> int:
         ver = m.group(1)
     print(f"SDK：{sdk}（{ver}）")
     print(f"运行态根：{base}")
+    print("")
+    report_transcription_tiers(sdk)
+    print("")
     code, out = cexec(rcmd(sdk, ["doctor"]))
     print(out)
     return finish(code, "ok" if code == 0 else "doctor-failed")
