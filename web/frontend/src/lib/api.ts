@@ -559,6 +559,7 @@ export function streamChat(
   onRecoveryUnavailable?: () => void,
   attachments: UploadedFile[] = [],
   onQuestion?: (q: ChatQuestion) => void,
+  onHeartbeat?: (note: string) => void,
 ): AbortController {
   const controller = new AbortController();
   let lastEventId = 0;
@@ -595,6 +596,9 @@ export function streamChat(
           try { onActivity(JSON.parse(data) as string); } catch { onActivity(data); }
         } else if (currentEvent === 'question' && onQuestion) {
           try { onQuestion(JSON.parse(data) as ChatQuestion); } catch { /* 解析失败忽略 */ }
+        } else if (currentEvent === 'heartbeat') {
+          // 防呆心跳：独立于 activity/thinking，仅作「未卡住」提示，不覆盖真实状态。
+          if (onHeartbeat) { try { onHeartbeat(JSON.parse(data) as string); } catch { onHeartbeat(data); } }
         } else if (currentEvent === 'error') {
           let msg = '执行失败';
           try { msg = JSON.parse(data) as string; } catch { msg = data; }

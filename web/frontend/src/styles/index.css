@@ -606,6 +606,8 @@ textarea.field { resize: vertical; min-height: 90px; }
   background: var(--accent-end); box-shadow: 0 0 0 0 rgba(63,86,168,0.4);
   animation: pulse 1.4s ease-out infinite;
 }
+/* 防呆「未卡住」提示：附着在真实活动状态后，弱化显示，不喧宾夺主 */
+.live-still { color: var(--text-tertiary, var(--text-secondary)); opacity: 0.75; font-size: 12px; }
 @keyframes pulse {
   0% { box-shadow: 0 0 0 0 rgba(63,86,168,0.34); }
   70% { box-shadow: 0 0 0 7px rgba(63,86,168,0); }

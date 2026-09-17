@@ -94,7 +94,7 @@ export default function ChatPage({ session, stream, onSend, onStop, onResend, on
 
   useEffect(() => {
     if (!isEmpty) messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [session.messages, stream?.content, stream?.thinking, stream?.activity, isEmpty]);
+  }, [session.messages, stream?.content, stream?.thinking, stream?.activity, stream?.stillWorking, isEmpty]);
 
   useEffect(() => {
     const el = textareaRef.current;
@@ -239,6 +239,7 @@ export default function ChatPage({ session, stream, onSend, onStop, onResend, on
                 isStreaming={live}
                 thinking={live ? stream!.thinking : ''}
                 activity={live ? stream!.activity : ''}
+                stillWorking={live ? stream!.stillWorking : ''}
                 actions={actions}
               />
             );

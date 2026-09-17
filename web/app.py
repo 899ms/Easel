@@ -13,7 +13,6 @@ import re
 import shutil
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import urllib.error
@@ -80,6 +79,12 @@ OPENCLAW_SESSIONS_DIR = Path.home() / f".openclaw-{OPENCLAW_PROFILE}" / "agents"
 # 实测 transcript 里 assistant 只有 text 块、thinking 恒为 0）面板留空，调高档位也不会有内容。
 # 默认 medium：让支持思考的部署直接显示较完整思考；EASEL_THINKING_LEVEL 可覆盖（low 提速 / high 更详尽）。
 THINKING_LEVEL = (os.environ.get("EASEL_THINKING_LEVEL", "").strip() or "medium")
+
+# gateway 进程把原始事件流（token/thinking/收尾）写到的**单个共享文件**。
+# 关键：`openclaw agent` 只是瘦客户端，没有 --raw-stream 标志——只有常驻 gateway 按它自己
+# 的 OPENCLAW_RAW_STREAM/OPENCLAW_RAW_STREAM_PATH 写这个文件（见 scripts/gateway.sh）。
+# web 侧 tail 它做流式；默认值必须与 gateway.sh 里 EASEL_RAW_STREAM_PATH 的默认一致。
+SHARED_RAW_STREAM = Path(os.environ.get("EASEL_RAW_STREAM_PATH", "/tmp/easel-raw-stream.jsonl"))
 
 
 def _heal_openclaw_session(sk: str) -> None:
@@ -1095,8 +1100,15 @@ def _read_job_events(turn_id: str, after: int = 0) -> list[dict]:
     return events
 
 
-def _raw_event_for_session(line: str, expected_session_id: str) -> dict | None:
-    """Parse one OpenClaw raw event and reject events from concurrent sessions."""
+def _raw_event_for_run(line: str, expected_run_id: str | None) -> dict | None:
+    """Parse one OpenClaw raw event and reject events from other runs.
+
+    The gateway multiplexes every run into one shared raw-stream file, and its
+    events carry `runId` (not `sessionId`). A turn latches onto its own runId —
+    the first event seen after the turn starts — and must ignore any event with
+    a different runId. `expected_run_id=None` means not-yet-latched → accept, so
+    the caller can latch from `event['runId']`.
+    """
     line = line.strip()
     if not line:
         return None
@@ -1106,9 +1118,10 @@ def _raw_event_for_session(line: str, expected_session_id: str) -> dict | None:
         return None
     if not isinstance(event, dict):
         return None
-    event_session_id = event.get("sessionId")
-    if event_session_id and event_session_id != expected_session_id:
-        return None
+    if expected_run_id is not None:
+        rid = event.get("runId")
+        if rid is not None and rid != expected_run_id:
+            return None
     return event
 
 
@@ -1197,11 +1210,11 @@ async def api_chat_job_stream(turn_id: str, after: int = 0):
 async def api_chat_stream(req: ChatRequest):
     """SSE 真流式对话。
 
-    `openclaw agent` CLI 会把整段模型输出缓冲到结束才打印（stdout 无增量），
-    因此改为让嵌入式 agent 把「模型原始流」逐 token 写入一个**每轮独立**的 jsonl
-    （env: OPENCLAW_RAW_STREAM=1 + OPENCLAW_RAW_STREAM_PATH），后端实时 tail 这个文件，
-    把 assistant_text_stream 的 token delta 立即转成 SSE `token`、thinking delta 转成 `thinking`。
-    每轮独立文件天然无并发串扰。stdout 仅留作错误/兜底。
+    `openclaw agent` CLI 会把整段模型输出缓冲到结束才打印（stdout 无增量）。真正跑模型的是
+    常驻 gateway，它按自己的 OPENCLAW_RAW_STREAM/OPENCLAW_RAW_STREAM_PATH 把「模型原始流」逐
+    token 写到**单个共享 jsonl**（SHARED_RAW_STREAM，见 scripts/gateway.sh）。后端在本轮开始时
+    记下该文件尾偏移、实时 tail 之后追加的行，用 runId 闩锁隔离本轮，把 assistant_text_stream 的
+    token delta 转成 SSE `token`、thinking delta 转成 `thinking`。stdout 仅留作错误/兜底。
     """
     # 每轮末尾追加「先查技能库」提醒，抗长对话指令衰减（对用户不可见）
     message = _chat_message(req)
@@ -1245,9 +1258,13 @@ async def api_chat_stream(req: ChatRequest):
             client_q.put_nowait({"t": kind, "text": text, "id": event_seq, **extra})
 
         _heal_openclaw_session(sk)       # 清洗历史里无签名 thinking 块，防回放失效
-        fd, raw_path = tempfile.mkstemp(prefix="pc-stream-", suffix=".jsonl")
-        os.close(fd)
-        raw_path = Path(raw_path)
+        # 原始事件流由常驻 gateway 写到共享文件（见 SHARED_RAW_STREAM / scripts/gateway.sh），
+        # 不是 agent 客户端写的。本轮开始时记下文件当前尾偏移：只读此偏移之后追加的行，
+        # 再用首个新事件的 runId 闩锁本轮，隔离其它并发会话的事件。
+        try:
+            raw_start_offset = SHARED_RAW_STREAM.stat().st_size
+        except OSError:
+            raw_start_offset = 0
 
         cmd = openclaw_base_cmd() + [
             "--profile", OPENCLAW_PROFILE, "agent", "--agent", "main",
@@ -1256,8 +1273,8 @@ async def api_chat_stream(req: ChatRequest):
             "--timeout", str(TIMEOUT_CHAT), "--message", message,
         ]
         env = _proxy_env()
-        env["OPENCLAW_RAW_STREAM"] = "1"
-        env["OPENCLAW_RAW_STREAM_PATH"] = str(raw_path)
+        # 注意：不要在客户端 env 上设 OPENCLAW_RAW_STREAM*——`agent` 客户端不写 raw 流，
+        # 设了也没用；raw 流开关在 gateway 侧（scripts/gateway.sh）。
         # 告诉 skill：本部署的 ask_user 选项卡片是否可用。卡片依赖 gateway 的
         # question.* RPC（仅 2026.9.x 有），2026.6.11 上桥接不可用 → skill 改用
         # 「文字问答跨轮等待」拿短信验证码，而不是空等卡片超时。
@@ -1282,10 +1299,6 @@ async def api_chat_stream(req: ChatRequest):
             to_client("activity", "⏳ 这个会话正在另一个窗口运行，请稍候再试")
             to_client("done", sessionKey=sk)
             client_q.put_nowait(CLIENT_DONE)
-            try:
-                raw_path.unlink()
-            except OSError:
-                pass
             return
 
         try:
@@ -1296,10 +1309,6 @@ async def api_chat_stream(req: ChatRequest):
         except BaseException:
             lock.release()
             xlock.release()
-            try:
-                raw_path.unlink()
-            except OSError:
-                pass
             _save_turn(pk, "done", "❌ 启动失败，请重试", {
                 "turn_id": turn_id, "clean_end": False, "stop_reason": "spawn_failed",
             })
@@ -1308,12 +1317,15 @@ async def api_chat_stream(req: ChatRequest):
             client_q.put_nowait(CLIENT_DONE)
             return
         _RUNNING_CHAT[sk] = proc         # 注册运行中进程，供 /api/chat/stop 显式终止
+        # 经 gateway 后客户端 stdout 没有 model-fetch 标记（那是独立跑 agent 才有），先立刻
+        # 给一个「正在思考」活动指示，随后 token 从共享 raw stream 流进来接管显示。
+        to_client("activity", "🧠 正在思考…")
 
         q = asyncio.Queue()
         SENTINEL = object()
         stdout_lines = []
-        expected_raw_session_id = _openclaw_session_id(sk)
         run_info: dict = {"stop_reason": None, "last_ev": None, "saw_message_end": False,
+                          "run_id": None,
                           "fetch_count": 0, "token_chars": 0, "thinking_chars": 0,
                           "delegated": False, "ignored_foreign_events": 0}
 
@@ -1405,17 +1417,23 @@ async def api_chat_stream(req: ChatRequest):
             loop.run_in_executor(None, _question_poll)
 
         def _handle(line: str):
-            o = _raw_event_for_session(line, expected_raw_session_id)
+            o = _raw_event_for_run(line, run_info["run_id"])
             if o is None:
-                # OpenClaw can multiplex concurrent-session diagnostics into one raw stream.
-                # Those events must not alter this turn's visible stream or completion diagnostics.
+                # 属其它并发 run 的事件（或无法解析）：绝不混入本轮可见流/收尾诊断，仅计数。
                 try:
                     parsed = json.loads(line)
-                    if isinstance(parsed, dict) and parsed.get("sessionId") not in (None, expected_raw_session_id):
+                    rid = parsed.get("runId") if isinstance(parsed, dict) else None
+                    if rid is not None and run_info["run_id"] is not None and rid != run_info["run_id"]:
                         run_info["ignored_foreign_events"] += 1
                 except Exception:
                     pass
                 return
+            # 首个带 runId 的事件闩锁本轮 run（之后 _raw_event_for_run 只放行这个 run）。
+            if run_info["run_id"] is None:
+                rid = o.get("runId")
+                if rid is None:
+                    return          # 还没拿到 runId，等下一条带 runId 的事件再闩锁
+                run_info["run_id"] = rid
             ev, et, delta = o.get("event"), o.get("evtType"), o.get("delta") or ""
             # 记录最后一个 raw 事件：正常收尾 last_ev == assistant_message_end；
             # 若停在 text_delta/thinking_delta 说明输出或思考流被中断、没正常收尾（本次排查关键信号）。
@@ -1437,7 +1455,17 @@ async def api_chat_stream(req: ChatRequest):
 
         def _tail():
             try:
-                with open(raw_path, "r", encoding="utf-8") as f:
+                f = None
+                # gateway 刚起或本轮还没产生事件时文件可能暂不存在：轮询等它出现（进程先退出则收尾）。
+                while f is None:
+                    try:
+                        f = open(SHARED_RAW_STREAM, "r", encoding="utf-8")
+                    except OSError:
+                        if proc.poll() is not None:
+                            return
+                        time.sleep(0.04)
+                with f:
+                    f.seek(raw_start_offset)   # 只读本轮开始后追加的行，跳过历史轮次
                     buf = ""
                     while True:
                         chunk = f.readline()
@@ -1579,10 +1607,6 @@ async def api_chat_stream(req: ChatRequest):
                     }, ensure_ascii=False) + "\n")
             except Exception:
                 pass
-            try:
-                raw_path.unlink()
-            except OSError:
-                pass
             # 落盘完整结果：后端跑完整轮不依赖客户端连接，断线后前端用 /api/chat/last 取回
             _save_turn(pk, "done", "".join(full_text), {
                 "turn_id": turn_id,
@@ -1625,9 +1649,13 @@ async def api_chat_stream(req: ChatRequest):
                 item = await asyncio.wait_for(client_q.get(), timeout=10)
             except asyncio.TimeoutError:
                 # 长时间无输出（等模型长回复 / 制作类长任务）→ 发心跳，让用户知道没卡死。
+                # 用独立的 `heartbeat` 事件，不走 `activity`：否则会覆盖掉真实的
+                # 「🧠 正在思考…/🛠️ 制作中…」状态与思考流（防呆消息把思考设计顶掉的根因）。
+                # 发出后重置 idle_since → 心跳按 30s 一次的节奏，不再每 10s 重复刷屏。
                 if time.monotonic() - idle_since >= 30:
-                    yield {"event": "activity", "data": json.dumps(
-                        "⏳ 仍在处理中，未卡住…（复杂或制作类任务会花点时间）", ensure_ascii=False)}
+                    idle_since = time.monotonic()
+                    yield {"event": "heartbeat", "data": json.dumps(
+                        "仍在处理中，未卡住…（复杂或制作类任务会花点时间）", ensure_ascii=False)}
                 continue
             if item is CLIENT_DONE:
                 break
