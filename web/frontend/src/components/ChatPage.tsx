@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect } from 'react';
 import MessageBubble from './MessageBubble';
 import QuestionCards from './QuestionCards';
+import BrushEntry from './BrushEntry';
 import type { ChatSession, ChatMessage, StreamState } from '../lib/store';
 import { uploadFiles, adoptOversize } from '../lib/api';
 import type { UploadedFile } from '../lib/api';
@@ -134,17 +135,20 @@ export default function ChatPage({ session, stream, onSend, onStop, onResend, on
           ))}
         </div>
       )}
-      <textarea
-        ref={textareaRef}
-        className="chat-input"
-        placeholder={dragOver ? '松手上传素材…' : hero ? '把你的想法告诉我，选题 / 文案 / 卡片 / 视频 / 发布都行…（可拖入图片/文档当素材）' : '发消息…（Enter 发送，Shift+Enter 换行，可拖入/粘贴素材）'}
-        value={input}
-        onChange={(e) => setInput(e.target.value)}
-        onKeyDown={handleKeyDown}
-        onPaste={onPaste}
-        rows={1}
-        autoFocus={hero}
-      />
+      <div className="composer-top">
+        <BrushEntry onPick={(t) => { setInput(t); requestAnimationFrame(() => textareaRef.current?.focus()); }} />
+        <textarea
+          ref={textareaRef}
+          className="chat-input"
+          placeholder={dragOver ? '松手上传素材…' : hero ? '把你的想法告诉我，选题 / 文案 / 卡片 / 视频 / 发布都行…（可拖入图片/文档当素材）' : '发消息…（Enter 发送，Shift+Enter 换行，可拖入/粘贴素材）'}
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          onKeyDown={handleKeyDown}
+          onPaste={onPaste}
+          rows={1}
+          autoFocus={hero}
+        />
+      </div>
       <input ref={fileInputRef} type="file" multiple hidden
         onChange={(e) => { if (e.target.files) doUpload(e.target.files); e.target.value = ''; }} />
       <div className="composer-bar">
