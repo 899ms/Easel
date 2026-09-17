@@ -1,6 +1,6 @@
 // 技能中文展示名（本地补丁 · 2026-09-17）
 // 展示层：中文名给用户看（大字）；skill id 原名保持小字，供 agent / 排查使用。
-// 数据源：E:/easel-pipeline-port/easel-capability-menu.json（重新生成即可更新）
+// 数据源：能力清单菜单（capability-menu），重新生成即可更新。
 export const SKILL_DISPLAY_NAMES: Record<string, string> = {
   'ai-image-gen': 'AI 生图',
   'ai-music': 'BGM / 音乐生成',

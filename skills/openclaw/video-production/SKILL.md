@@ -45,8 +45,8 @@ layer: produce
 ## 快速开始
 
 ```bash
-python <ROOT>/skills/video-production/scripts/video_pipeline.py doctor
-python <ROOT>/skills/video-production/scripts/video_pipeline.py start --source "C:/path/raw.mp4" --brief "主题一句话"
+python <ROOT>/skills/openclaw/video-production/scripts/video_pipeline.py doctor
+python <ROOT>/skills/openclaw/video-production/scripts/video_pipeline.py start --source "C:/path/raw.mp4" --brief "主题一句话"
 ```
 
 `start` 依次做：建运行态 → 机械段（摸底 / 转录 / 分场）→ **停在需要人参与的地方**。
@@ -75,8 +75,8 @@ python <ROOT>/skills/video-production/scripts/video_pipeline.py start --source "
 - 写回答并续跑：
 
 ```bash
-python <ROOT>/skills/video-production/scripts/video_pipeline.py answer --id checkpoint-1 --values approve --notes "可选备注"
-python <ROOT>/skills/video-production/scripts/video_pipeline.py resume
+python <ROOT>/skills/openclaw/video-production/scripts/video_pipeline.py answer --id checkpoint-1 --values approve --notes "可选备注"
+python <ROOT>/skills/openclaw/video-production/scripts/video_pipeline.py resume
 ```
 
 ### 自由输入题（如 need-design-table）
