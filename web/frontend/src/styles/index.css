@@ -1086,3 +1086,8 @@ textarea.field { resize: vertical; min-height: 90px; }
   background: rgba(0,0,0,0.55); color: #fff; cursor: pointer; transition: background var(--t-fast); }
 .gcard:hover .gcard-del { display: inline-flex; }
 .gcard-del:hover { background: var(--red); }
+
+/* 技能库中文展示名（中文大字 + 原名小字） */
+.skill-card-rawname { font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace; font-size: 11px; color: var(--text-tertiary); margin-top: -3px; letter-spacing: 0; }
+.skill-detail-rawname { font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace; font-size: 12px; color: var(--text-tertiary); margin-top: 3px; letter-spacing: 0; }
+
