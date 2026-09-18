@@ -27,11 +27,13 @@ import argparse
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 SHARED_SCRIPTS = Path(__file__).resolve().parents[3] / "shared" / "scripts"
 sys.path.insert(0, str(SHARED_SCRIPTS))
 import content_guard  # noqa: E402
+import platform_readback  # noqa: E402  发布读回对账（B站 reader）
 
 # 常用投稿分区名 → tid（B站分区，节选常用）
 PARTITIONS: dict[str, int] = {
@@ -147,12 +149,33 @@ def cmd_upload(a) -> int:
         label="B站投稿内容",
     )
     print("投稿中 ...", file=sys.stderr)
+    # 发前快照 + 时间窗基准（读回对账用；快照失败自动退化为标题+时间窗）
+    snapshot = platform_readback.capture_bilibili_snapshot(cookie)
+    started_ms = int(time.time() * 1000)
     rc = subprocess.call(cmd)
     if rc == 0:
+        # 发布读回对账（权威判定：读回对上才算成功——没有平台侧证据绝不报成功）
+        title = a.title or Path(a.video).stem
+        try:
+            result = platform_readback.verify_bilibili_publish(
+                cookie, title=title, since_ms=started_ms, snapshot_ids=snapshot)
+        except Exception as e:  # noqa: BLE001
+            _die(f"投稿已提交但读回通道异常：{e}——去创作中心人工核对，先别重发。", 4)
+        if result.outcome == "verified" and result.matched:
+            m = result.matched
+            acct = (result.evidence.get("account") or {}).get("name", "")
+            print(f"✅ 读回核验：{m.platform_content_id}（{m.status}）；账号：{acct}", file=sys.stderr)
+        else:
+            hints = {
+                "unverified": "读回通了但多轮未见新稿件（索引/审核延迟）",
+                "login_required": "读回时登录态失效，请重新扫码登录",
+                "readback_error": f"读回通道故障（{result.error}）",
+            }
+            _die(f"投稿已提交但读回未核实（{result.outcome}）：{hints.get(result.outcome, '')}——去创作中心核对，先别重发。", 4)
         # 投稿成功 → 落统一内容日历（对话页自动；发布页 B 站走 biliup CLI 由 web 记录，路径不同不重复）
         try:
             import calendar_ops
-            calendar_ops.record_publish("bilibili", a.title or Path(a.video).stem,
+            calendar_ops.record_publish("bilibili", title,
                                         ptype="视频", tags=(a.tag or ""),
                                         note=(a.desc or ""), source="chat")
         except Exception:
@@ -186,9 +209,19 @@ def cmd_selftest(_a) -> int:
     c2 = build_cmd(a2)
     assert "--source" in c2 and c2[c2.index("--copyright")+1] == "2", "转载参数缺失"
     assert c2[c2.index("--title")+1] == "v", "无标题应回退文件名"
+    # 读回对账（离线：B站响应夹具 → 统一 WorkItem 映射 + 入口存在）
+    assert callable(platform_readback.verify_bilibili_publish), "B站读回入口缺失"
+    fixture = {"Archive": {"aid": 117091629795524, "bvid": "BV18JgA6pEnA",
+                           "title": "自动化链路测试", "state": 0, "state_desc": "开放浏览",
+                           "ctime": 1786676676, "ptime": 1786676728, "duration": 8},
+               "stat": {"view": 12, "like": 1, "comment": 0, "danmaku": 0}}
+    w = platform_readback._map_bilibili_item(fixture)
+    assert w and w.platform_content_id == "BV18JgA6pEnA", "B站条目映射：id"
+    assert w.title == "自动化链路测试" and w.status == "开放浏览", "B站条目映射：标题/状态"
+    assert w.published_at_ms == 1786676728 * 1000, "B站条目映射：时间（优先 ptime）"
     # check（此环境已装 biliup）
     assert cmd_check(None) in (0, 3)
-    print("✅ selftest 通过（分区映射/命令构造/全局选项顺序/转载/check）")
+    print("✅ selftest 通过（分区映射/命令构造/全局选项顺序/转载/check/读回映射）")
     return 0
 
 
