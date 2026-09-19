@@ -33,6 +33,17 @@ SHARED_SCRIPTS = Path(__file__).resolve().parents[3] / "shared" / "scripts"
 sys.path.insert(0, str(SHARED_SCRIPTS))
 import content_guard  # noqa: E402
 
+
+def _direct_env() -> dict:
+    """B站走直连：剔除代理环境变量（系统代理/VPN 开着的场景，上传不被劫持）。"""
+    import os
+    env = dict(os.environ)
+    for k in ("http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
+        env.pop(k, None)
+    env.setdefault("no_proxy", "*")
+    env.setdefault("NO_PROXY", "*")
+    return env
+
 # 常用投稿分区名 → tid（B站分区，节选常用）
 PARTITIONS: dict[str, int] = {
     "动画": 1, "音乐": 3, "游戏": 4, "娱乐": 5, "生活": 160, "日常": 21,
@@ -94,7 +105,7 @@ def cmd_check(_a) -> int:
     ok = True
     if _has_biliup():
         try:
-            v = subprocess.run(["biliup", "--version"], capture_output=True, text=True)
+            v = subprocess.run(["biliup", "--version"], capture_output=True, text=True, env=_direct_env())
             print(f"✅ biliup: {(v.stdout or v.stderr).strip()}")
         except Exception:
             print("✅ biliup 已安装")
@@ -111,7 +122,7 @@ def cmd_login(a) -> int:
     cookie = a.cookie or "cookies.json"
     print(f"启动 B站扫码登录，cookie 将保存到 {cookie} ...", file=sys.stderr)
     print("（需终端可显示二维码 + 手机 B站 App 扫码 + 外网）", file=sys.stderr)
-    return subprocess.call(["biliup", "-u", cookie, "login"])
+    return subprocess.call(["biliup", "-u", cookie, "login"], env=_direct_env())
 
 
 def cmd_tid(_a) -> int:
@@ -147,7 +158,7 @@ def cmd_upload(a) -> int:
         label="B站投稿内容",
     )
     print("投稿中 ...", file=sys.stderr)
-    rc = subprocess.call(cmd)
+    rc = subprocess.call(cmd, env=_direct_env())
     if rc == 0:
         # 投稿成功 → 落统一内容日历（对话页自动；发布页 B 站走 biliup CLI 由 web 记录，路径不同不重复）
         try:
