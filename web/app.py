@@ -69,6 +69,8 @@ OUTPUTS_DIR = PROJECT_ROOT / "outputs"
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 REACT_DIR = Path(__file__).resolve().parent / "frontend" / "dist"
 OPENCLAW_PROFILE = "easel"
+# 对话传输层：http＝直连常驻网关（OpenAI 兼容端点，免每轮进程冷启动）；cli＝旧 spawn 路径（回退）
+CHAT_TRANSPORT = os.environ.get("EASEL_CHAT_TRANSPORT", "http").strip().lower()
 OPENCLAW_WORKSPACE = Path.home() / ".openclaw" / f"workspace-{OPENCLAW_PROFILE}"
 # OpenClaw 会话历史（transcript）目录：<profile 配置目录>/agents/main/sessions/<session-id>.jsonl
 OPENCLAW_SESSIONS_DIR = Path.home() / f".openclaw-{OPENCLAW_PROFILE}" / "agents" / "main" / "sessions"
@@ -85,6 +87,47 @@ THINKING_LEVEL = (os.environ.get("EASEL_THINKING_LEVEL", "").strip() or "medium"
 # 的 OPENCLAW_RAW_STREAM/OPENCLAW_RAW_STREAM_PATH 写这个文件（见 scripts/gateway.sh）。
 # web 侧 tail 它做流式；默认值必须与 gateway.sh 里 EASEL_RAW_STREAM_PATH 的默认一致。
 SHARED_RAW_STREAM = Path(os.environ.get("EASEL_RAW_STREAM_PATH", "/tmp/easel-raw-stream.jsonl"))
+
+
+class _GatewayHttpProc:
+    """HTTP 直连模式下的「伪进程」：给主循环 / 停止逻辑提供 poll/wait/kill 兼容面。"""
+
+    def __init__(self) -> None:
+        self._done = False
+        self._task = None
+
+    def finish(self) -> None:
+        self._done = True
+
+    def poll(self):
+        return 0 if self._done else None
+
+    def terminate(self) -> None:
+        self._done = True
+        if self._task is not None:
+            try:
+                self._task.cancel()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def kill(self) -> None:
+        self.terminate()
+
+    def wait(self, timeout=None):  # 兼容 await asyncio.to_thread(proc.wait, ...)
+        return 0
+
+
+def _gateway_http_ready() -> bool:
+    """探测 gateway 的 OpenAI 兼容端点是否可用（不可用则自动回退 CLI 路径）。
+
+    需要 openclaw 侧开启 gateway.http.endpoints.chatCompletions。
+    """
+    try:
+        rq = urllib.request.Request("http://127.0.0.1:18789/v1/models")
+        with urllib.request.urlopen(rq, timeout=2) as resp:
+            return resp.status == 200
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _heal_openclaw_session(sk: str) -> None:
@@ -1737,6 +1780,58 @@ async def api_chat_stream(req: ChatRequest):
                 pass
             client_q.put_nowait({"t": kind, "text": text, "id": event_seq, **extra})
 
+        # 秒级反馈：发出即亮「已收到」，不等 agent 冷启动（首个 SSE 事件，随流回放必达）
+        to_client("activity", "⏳ 已收到，正在唤醒 agent…")
+
+        async def _run_gateway_turn(hproc):
+            """HTTP 直连常驻网关跑一轮（OpenAI 兼容端点 /v1/chat/completions，原生 SSE）。
+
+            与 CLI 路径的差异：agent 在常驻 gateway 进程里直接跑，无每轮进程冷启动；
+            正文 token 经 SSE 直接进 q（与 CLI 路径共享同一消费出口）；
+            收尾由主循环统一负责（proc.poll() 兼容面）。
+            """
+            body = {
+                "model": "openclaw/default",
+                "stream": True,
+                "messages": [{"role": "user", "content": message}],
+            }
+            headers = {"x-openclaw-session-key": f"agent:main:{sk}"}
+            tool_noted = False
+            try:
+                import httpx as _httpx
+                timeout = _httpx.Timeout(TIMEOUT_CHAT + 60, connect=10)
+                async with _httpx.AsyncClient(timeout=timeout) as client:
+                    async with client.stream(
+                            "POST", "http://127.0.0.1:18789/v1/chat/completions",
+                            json=body, headers=headers) as resp:
+                        if resp.status_code != 200:
+                            raw = (await resp.aread())[:200].decode("utf-8", "replace")
+                            to_client("error", f"❌ 对话失败（HTTP {resp.status_code}）：{raw[:160]}")
+                            return
+                        async for line in resp.aiter_lines():
+                            if not line.startswith("data: "):
+                                continue
+                            payload = line[6:]
+                            if payload == "[DONE]":
+                                break
+                            try:
+                                d = json.loads(payload)
+                            except ValueError:
+                                continue
+                            delta = (d.get("choices") or [{}])[0].get("delta") or {}
+                            c = delta.get("content")
+                            if c:
+                                _emit("token", c)
+                            if delta.get("tool_calls") and not tool_noted:
+                                tool_noted = True
+                                to_client("activity", "🔧 正在执行操作…")
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                to_client("error", f"❌ 网关连接失败：{str(e)[:140]}")
+            finally:
+                hproc.finish()
+
         _heal_openclaw_session(sk)       # 清洗历史里无签名 thinking 块，防回放失效
         # 原始事件流由常驻 gateway 写到共享文件（见 SHARED_RAW_STREAM / scripts/gateway.sh），
         # 不是 agent 客户端写的。本轮开始时记下文件当前尾偏移：只读此偏移之后追加的行，
@@ -1781,22 +1876,29 @@ async def api_chat_stream(req: ChatRequest):
             client_q.put_nowait(CLIENT_DONE)
             return
 
-        try:
-            proc = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                cwd=str(PROJECT_ROOT), text=True, bufsize=1, env=env,
-            )
-        except BaseException:
-            lock.release()
-            xlock.release()
-            _save_turn(pk, "done", "❌ 启动失败，请重试", {
-                "turn_id": turn_id, "clean_end": False, "stop_reason": "spawn_failed",
-            })
-            to_client("error", "❌ 启动失败，请重试")
-            to_client("done", sessionKey=sk)
-            client_q.put_nowait(CLIENT_DONE)
-            return
-        _RUNNING_CHAT[sk] = proc         # 注册运行中进程，供 /api/chat/stop 显式终止
+        is_http = CHAT_TRANSPORT == "http" and _gateway_http_ready()
+        if is_http:
+            # HTTP 直连常驻网关：无进程冷启动（agent 在 gateway 进程里跑）
+            proc = _GatewayHttpProc()
+        else:
+            try:
+                proc = subprocess.Popen(
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    cwd=str(PROJECT_ROOT), text=True, bufsize=1, env=env,
+                )
+            except BaseException:
+                lock.release()
+                xlock.release()
+                _save_turn(pk, "done", "❌ 启动失败，请重试", {
+                    "turn_id": turn_id, "clean_end": False, "stop_reason": "spawn_failed",
+                })
+                to_client("error", "❌ 启动失败，请重试")
+                to_client("done", sessionKey=sk)
+                client_q.put_nowait(CLIENT_DONE)
+                return
+        _RUNNING_CHAT[sk] = proc         # 注册运行中进程（HTTP 模式为伪进程），供 /api/chat/stop
+        if is_http:
+            proc._task = loop.create_task(_run_gateway_turn(proc))
         # 经 gateway 后客户端 stdout 没有 model-fetch 标记（那是独立跑 agent 才有），先立刻
         # 给一个「正在思考」活动指示，随后 token 从共享 raw stream 流进来接管显示。
         to_client("activity", "🧠 正在思考…")
@@ -1966,12 +2068,14 @@ async def api_chat_stream(req: ChatRequest):
             finally:
                 loop.call_soon_threadsafe(q.put_nowait, SENTINEL)
 
-        stdout_fut = loop.run_in_executor(None, _drain_stdout)
-        loop.run_in_executor(None, _tail)
+        stdout_fut = None
+        if not is_http:
+            stdout_fut = loop.run_in_executor(None, _drain_stdout)
+            loop.run_in_executor(None, _tail)
 
         deadline = time.monotonic() + TIMEOUT_CHAT + 30
         emitted = False
-        tail_finished = False
+        tail_finished = is_http   # HTTP 模式没有文件 tail：直接视为完成，靠 proc.poll() 收尾
         try:
             while True:
                 # A raw-stream reader failure must not be mistaken for model
@@ -2004,10 +2108,11 @@ async def api_chat_stream(req: ChatRequest):
                     to_client("question", item["text"])
             rc = proc.poll()
             # 等 stdout 读完（stopReason 行在进程收尾时才打印，避免 _tail 先发 SENTINEL 时漏读）
-            try:
-                await asyncio.wait_for(stdout_fut, timeout=2)
-            except Exception:
-                pass
+            if stdout_fut is not None:
+                try:
+                    await asyncio.wait_for(stdout_fut, timeout=2)
+                except Exception:
+                    pass
             sr = run_info.get("stop_reason")
             if not emitted:
                 clean = clean_agent_output("".join(stdout_lines))
