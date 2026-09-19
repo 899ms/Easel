@@ -210,7 +210,10 @@ if strip_nulls(providers):
 # 仅当真正写了 anthropic provider 时，才补设它的 provider 级超时（见文末 timeoutSeconds）；
 # 否则会给 OpenAI/MAAS 用户凭空造出一个只有 timeoutSeconds、缺 baseUrl/models 的残缺 anthropic provider。
 $anthropicSynced = $false
-if (Is-UsableKey $envValues['OPENAI_MAAS_API_KEY'] -and $envValues.ContainsKey('OPENAI_MAAS_ENDPOINT')) {
+# 注意函数调用外面这对括号不能省：`if (Is-UsableKey $x -and $y)` 会让解析器进入命令模式，
+# 把 `-and` 当成 Is-UsableKey 的参数名（简单函数会把它静默吞进 $args），
+# 于是 ContainsKey 那半边守卫被丢掉且不报错。加括号才让 -and 回到运算符语义。
+if ((Is-UsableKey $envValues['OPENAI_MAAS_API_KEY']) -and $envValues.ContainsKey('OPENAI_MAAS_ENDPOINT')) {
     $model = if ($envValues.ContainsKey('OPENAI_MAAS_MODEL')) { $envValues['OPENAI_MAAS_MODEL'] } else { 'gpt-5.5' }
     $port = if ($envValues.ContainsKey('OPENAI_MAAS_ADAPTER_PORT')) { $envValues['OPENAI_MAAS_ADAPTER_PORT'] } else { '18791' }
     $adapter = Join-Path $Root 'scripts\openai_maas_adapter.py'
@@ -226,14 +229,14 @@ if (Is-UsableKey $envValues['OPENAI_MAAS_API_KEY'] -and $envValues.ContainsKey('
         @{ path = 'models.providers.openai.models'; value = @(@{ id = $model; name = 'OpenAI model'; reasoning = $true; input = @('text', 'image') }) },
         @{ path = 'agents.defaults.model.primary'; value = "openai/$model" }
     )
-} elseif (Is-UsableKey $envValues['EASEL_LLM_API_KEY'] -and $envValues.ContainsKey('EASEL_LLM_BASE_URL')) {
+} elseif ((Is-UsableKey $envValues['EASEL_LLM_API_KEY']) -and $envValues.ContainsKey('EASEL_LLM_BASE_URL')) {
     # 原子写入整块 provider（含 header 与 anthropic-version）；整块替换会顺带清掉旧的专用 header。
     $hdr = if ($envValues.ContainsKey('EASEL_LLM_API_KEY_HEADER')) { $envValues['EASEL_LLM_API_KEY_HEADER'] } else { 'api-key' }
     $ver = if ($envValues.ContainsKey('EASEL_LLM_ANTHROPIC_VERSION')) { $envValues['EASEL_LLM_ANTHROPIC_VERSION'] } else { '2023-06-01' }
     Write-AnthropicProvider $envValues['EASEL_LLM_BASE_URL'] $envValues['EASEL_LLM_API_KEY'] $hdr $ver
     $anthropicSynced = $true
     OpenClaw-Config 'agents.defaults.model.primary' $(if ($envValues.ContainsKey('CLAUDE_MODEL')) { $envValues['CLAUDE_MODEL'] } else { 'anthropic/claude-sonnet-4-6' })
-} elseif (Is-UsableKey $envValues['ANTHROPIC_AUTH_TOKEN'] -and $envValues.ContainsKey('ANTHROPIC_BASE_URL')) {
+} elseif ((Is-UsableKey $envValues['ANTHROPIC_AUTH_TOKEN']) -and $envValues.ContainsKey('ANTHROPIC_BASE_URL')) {
     Write-AnthropicProvider $envValues['ANTHROPIC_BASE_URL'] $envValues['ANTHROPIC_AUTH_TOKEN'] '' ''
     $anthropicSynced = $true
     OpenClaw-Config 'agents.defaults.model.primary' $(if ($envValues.ContainsKey('CLAUDE_MODEL')) { $envValues['CLAUDE_MODEL'] } else { 'anthropic/claude-sonnet-4-6' })
