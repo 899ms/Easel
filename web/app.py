@@ -910,6 +910,486 @@ async def api_env_save(req: EnvUpdateRequest):
     }
 
 
+# ═══════════════════════════════════════════════════════════════════════
+# 设置面板 · 环境安装（skills/shared/scripts/install_tool.py 引擎桥）
+# 体检走引擎 check --json；安装后台跑、前端轮询 /api/env/job/{id}。
+# ═══════════════════════════════════════════════════════════════════════
+
+INSTALL_TOOL = SHARED_SCRIPTS / "install_tool.py"
+_ENV_TOOLS_CACHE: dict = {"ts": 0.0, "data": None}
+_ENV_JOBS: dict[str, dict] = {}
+
+
+@app.get("/api/env/tools")
+async def api_env_tools(refresh: bool = False):
+    """环境体检：引擎 check --json（15 秒缓存；refresh=1 强制重测）。"""
+    if not refresh and _ENV_TOOLS_CACHE["data"] and time.time() - _ENV_TOOLS_CACHE["ts"] < 15:
+        return _ENV_TOOLS_CACHE["data"]
+    try:
+        proc = await asyncio.to_thread(lambda: subprocess.run(
+            [sys.executable, str(INSTALL_TOOL), "--json", "check"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=240, cwd=str(PROJECT_ROOT)))
+    except subprocess.TimeoutExpired:
+        raise HTTPException(504, "环境体检超时，请稍后再试")
+    if proc.returncode != 0 or not (proc.stdout or "").strip():
+        raise HTTPException(500, f"环境体检失败：{(proc.stderr or '').strip()[-300:] or '无输出'}")
+    try:
+        data = json.loads(proc.stdout)
+    except json.JSONDecodeError as e:
+        raise HTTPException(500, f"体检输出解析失败：{e}")
+    data["cachedAt"] = int(time.time())
+    _ENV_TOOLS_CACHE.update({"ts": time.time(), "data": data})
+    return data
+
+
+class EnvInstallRequest(BaseModel):
+    id: str
+
+
+@app.post("/api/env/install")
+async def api_env_install(req: EnvInstallRequest):
+    """后台安装（引擎 install）：立即返回 jobId，前端轮询进度。"""
+    tid = (req.id or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,40}", tid):
+        raise HTTPException(400, "无效的工具 id")
+    job_id = uuid.uuid4().hex[:16]
+    job = {"jobId": job_id, "id": tid, "state": "running", "lines": [],
+           "result": None, "started": int(time.time()), "ended": None}
+    _ENV_JOBS[job_id] = job
+
+    def _run() -> None:
+        try:
+            proc = subprocess.Popen(
+                [sys.executable, str(INSTALL_TOOL), "--json", "install", tid],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, encoding="utf-8", errors="replace", cwd=str(PROJECT_ROOT))
+            for line in proc.stderr:            # 引擎进度日志走 stderr
+                line = line.rstrip()
+                if line:
+                    job["lines"].append(line)
+                    del job["lines"][:-40]      # 只留最近 40 行
+            out = (proc.stdout.read() or "").strip()
+            proc.wait(timeout=3600)
+            if out:
+                job["result"] = (json.loads(out).get("results") or [None])[0]
+            job["state"] = "ok" if (job["result"] or {}).get("state") == "ok" else "fail"
+        except Exception as e:  # noqa: BLE001
+            job["state"] = "fail"
+            job["result"] = {"id": tid, "state": "fail", "detail": f"{type(e).__name__}: {e}"}
+        finally:
+            job["ended"] = int(time.time())
+            _ENV_TOOLS_CACHE["ts"] = 0.0        # 装完让下一次体检不吃旧缓存
+
+    threading.Thread(target=_run, daemon=True).start()
+    return {"jobId": job_id, "id": tid, "state": "running"}
+
+
+@app.get("/api/env/job/{job_id}")
+async def api_env_job(job_id: str):
+    """查安装进度：running / ok / fail + 最近日志行 + 最终结果。"""
+    job = _ENV_JOBS.get(job_id)
+    if not job:
+        raise HTTPException(404, "任务不存在（服务可能重启过）")
+    return job
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 设置面板 · 模型配置（v1：按真实 .env / openclaw.json 只读展示 + 真自测）
+# ═══════════════════════════════════════════════════════════════════════
+
+
+def _mask_key(v: str) -> str:
+    v = (v or "").strip()
+    if not v:
+        return ""
+    return f"«{v[:5]}…{v[-4:]}»" if len(v) > 14 else "«已配置»"
+
+
+def _model_channels() -> dict:
+    env = _read_env()
+    primary = ""
+    try:
+        oc = Path.home() / ".openclaw-easel" / "openclaw.json"
+        if oc.is_file():
+            primary = str(json.loads(oc.read_text(encoding="utf-8"))
+                          .get("agents", {}).get("defaults", {}).get("model", {}).get("primary", ""))
+    except Exception:  # noqa: BLE001
+        pass
+
+    chat_rows = []
+    ob = (env.get("OPENAI_BASE_URL") or "").strip()
+    om = (env.get("OPENAI_MODEL") or "").strip()
+    ok_key = bool((env.get("OPENAI_API_KEY") or "").strip())
+    if ob or ok_key:
+        chat_rows.append({
+            "slot": "openai", "order": 1, "name": "deepseek",
+            "sub": "官方直连",
+            "type": "openai", "model": om or "deepseek-chat",
+            "baseUrl": ob, "keyMasked": _mask_key(env.get("OPENAI_API_KEY", "")),
+            "role": "主" if primary.startswith("openai/") else "备",
+            "result": "已配置" if ok_key else "缺 key",
+        })
+    ab = (env.get("ANTHROPIC_BASE_URL") or "").strip()
+    ak = (env.get("ANTHROPIC_API_KEY") or "").strip()
+    if ab or ak:
+        chat_rows.append({
+            "slot": "anthropic", "order": len(chat_rows) + 1, "name": "anthropic", "sub": "官方直连",
+            "type": "anthropic", "model": (env.get("CLAUDE_MODEL") or "claude-sonnet-4-6").strip(),
+            "baseUrl": ab or "官方", "keyMasked": _mask_key(ak),
+            "role": "备", "result": "已配置" if ak else "缺 key",
+        })
+    lb = (env.get("EASEL_LLM_BASE_URL") or "").strip()
+    lk = (env.get("EASEL_LLM_API_KEY") or "").strip()
+    if lb or lk:
+        chat_rows.append({
+            "slot": "relay", "order": len(chat_rows) + 1, "name": "relay", "sub": "中转站",
+            "type": "openai", "model": (env.get("CLAUDE_MODEL") or "deepseek-chat").strip(),
+            "baseUrl": lb or "（未配置）", "keyMasked": _mask_key(lk),
+            "role": "备", "result": "已配置" if lk else "缺 key",
+        })
+
+    custom_rows = []
+    try:
+        oc = Path.home() / ".openclaw-easel" / "openclaw.json"
+        if oc.is_file():
+            provs = (json.loads(oc.read_text(encoding="utf-8"))
+                     .get("models", {}).get("providers", {})) or {}
+            for pkey, pv in provs.items():
+                if pkey in ("openai", "anthropic", "relay") or not isinstance(pv, dict):
+                    continue
+                models = pv.get("models") if isinstance(pv.get("models"), list) else []
+                mid = models[0].get("id", "") if models and isinstance(models[0], dict) else ""
+                custom_rows.append({
+                    "slot": "custom", "order": 0, "name": pkey, "sub": "自定义",
+                    "type": "openai", "model": mid or "", "baseUrl": pv.get("baseUrl") or "",
+                    "keyMasked": _mask_key(str(pv.get("apiKey") or "")),
+                    "role": "主" if primary == f"{pkey}/{mid}" else "备",
+                    "result": "已配置" if str(pv.get("apiKey") or "").strip() else "缺 key",
+                    "deletable": True,
+                })
+    except Exception:  # noqa: BLE001
+        pass
+    chat_rows.extend(custom_rows)
+
+    sf = bool((env.get("SILICONFLOW_API_KEY") or "").strip())
+    trans_rows = [
+        {"order": 0, "name": "自带字幕", "sub": "视频自带 SRT/VTT 时直接读", "type": "脚本层",
+         "model": "—", "baseUrl": "—", "keyMasked": "—", "role": "免配", "result": "优先"},
+        {"slot": "siliconflow", "order": 1, "name": "siliconflow", "sub": "硅基流动", "type": "openai",
+         "model": "SenseVoiceSmall", "baseUrl": "https://api.siliconflow.cn/v1",
+         "keyMasked": _mask_key(env.get("SILICONFLOW_API_KEY", "")), "role": "主",
+         "result": "已配置" if sf else "缺 key"},
+    ]
+    channels: dict = {"chat": {"rows": chat_rows}, "transcribe": {"rows": trans_rows}}
+    try:
+        import model_registry as _mr  # skills/shared/scripts 已在 sys.path 上
+        _setting_env = {"video": "VIDEO_PROVIDER", "music": "MUSIC_PROVIDER", "voice": "VOICE_PROVIDER"}
+        for _gid, _ch in (("image", "image"), ("video", "video"), ("music", "music"), ("voice", "speech")):
+            _spec = _mr.MODEL_GROUPS[_gid]
+            _chosen = (env.get(_setting_env.get(_gid, ""), "") or "").strip()
+            _rows = []
+            for _p in _spec["providers"]:
+                _req = [k for k in _p["keys"] if k["required"]]
+                _bk = next((k for k in _p["keys"] if not k["secret"]
+                            and ("BASE" in k["env"] or "URL" in k["env"])), None)
+                _mk = next((k for k in _p["keys"] if not k["secret"] and "MODEL" in k["env"]), None)
+                _edit_keys = [k for k in _req if k is not _bk and k is not _mk]
+                _k1 = _edit_keys[0] if _edit_keys else None
+                _k2 = _edit_keys[1] if len(_edit_keys) > 1 else None
+                _ok = all(_is_set(env.get(k["env"])) or any(_is_set(env.get(a)) for a in k.get("aliases", []))
+                          for k in _req)
+                _masked = ""
+                if _k1:
+                    _raw = env.get(_k1["env"], "")
+                    if not _raw:
+                        for _a in _k1.get("aliases", []):
+                            if env.get(_a):
+                                _raw = env[_a]
+                                break
+                    _masked = _mask_key(_raw)
+                _rows.append({
+                    "slot": _p["id"], "order": 0, "name": _p["name"], "sub": _gid,
+                    "type": _p["id"], "model": (env.get(_mk["env"]) or "").strip() if _mk else "",
+                    "baseUrl": (env.get(_bk["env"]) or "").strip() if _bk else "",
+                    "keyMasked": _masked, "role": "主" if (_gid == "image" or _chosen == _p["id"]) else "备",
+                    "result": "已配置" if _ok else "未配置",
+                    "key2Label": _k2["label"] if _k2 else "",
+                    "key2Masked": _mask_key(env.get(_k2["env"], "")) if _k2 and _k2["secret"] else "",
+                    "modelEditable": _mk is not None,
+                    "baseEditable": _bk is not None,
+                    "baseOptional": (_bk is None) or (not _bk["required"]),
+                })
+            channels[_ch] = {"rows": _rows}
+    except Exception:  # noqa: BLE001
+        pass
+    return {"channels": channels, "primary": primary}
+
+
+@app.get("/api/settings/models")
+async def api_settings_models():
+    """模型通道：chat / transcribe（含可编辑的原值；key 只回脱敏）。"""
+    return _model_channels()
+
+
+def _write_env_direct(updates: dict[str, str]) -> None:
+    """后端受控键位专用：就地更新/追加 .env（不做 allowlist 过滤，仅服务端固定映射调用）。原子写。"""
+    updates = {k: v for k, v in updates.items() if k and v.strip() != ''}
+    if not updates:
+        return
+    lines = ENV_FILE.read_text(encoding='utf-8').splitlines() if ENV_FILE.is_file() else []
+    seen = set()
+    out = []
+    for line in lines:
+        s = line.strip()
+        matched = None
+        if s and not s.startswith('#') and '=' in s:
+            k = s.split('=', 1)[0].strip()
+            if k in updates:
+                matched = k
+        if matched is not None:
+            seen.add(matched)
+            out.append(f'{matched}={updates[matched]}')
+            continue
+        out.append(line)
+    appended = [f'{k}={v}' for k, v in updates.items() if k not in seen]
+    if appended:
+        if out and out[-1].strip() != '':
+            out.append('')
+        out.append('# ---- Easel 模型配置（Web 设置面板写入）----')
+        out.extend(appended)
+    tmp = ENV_FILE.with_suffix('.env.tmp')
+    tmp.write_text('\n'.join(out) + '\n', encoding='utf-8')
+    tmp.replace(ENV_FILE)
+
+
+RESERVED_PROVIDER_KEYS = {"openai", "anthropic", "relay"}
+
+
+def _sync_openclaw_chat(provider_updates: dict[str, dict], keep_custom: set[str], primary_ref: str) -> str:
+    """同步 chat 供应商到 ~/.openclaw-easel/openclaw.json：更新/新增 + 删除多余自定义 + 主模型。
+
+    provider_updates: {pkey: {"model","base","key"}}；keep_custom: 保留的自定义键；primary_ref: 目标主模型（空=不改）。
+    只有确有差异才落盘（改前备份 .bak-web）。
+    """
+    try:
+        oc = Path.home() / '.openclaw-easel' / 'openclaw.json'
+        if not oc.is_file():
+            return ''
+        data = json.loads(oc.read_text(encoding='utf-8'))
+        providers = data.setdefault('models', {}).setdefault('providers', {})
+        changed = False
+        for pkey in [k for k in list(providers.keys())
+                     if k not in RESERVED_PROVIDER_KEYS and k not in keep_custom]:
+            providers.pop(pkey, None)
+            changed = True
+        for pkey, vals in provider_updates.items():
+            prov = providers.setdefault(pkey, {})
+            base, key, model = vals.get('base', ''), vals.get('key', ''), vals.get('model', '')
+            if base and prov.get('baseUrl') != base:
+                _cur = str(prov.get('baseUrl') or '')
+                if _cur.startswith('http://127.0.0.1:8890'):
+                    pass  # 本地模型网关模式：保留网关地址（真实上游在 easel-models.yaml），勿改回直连
+                else:
+                    prov['baseUrl'] = base
+                    changed = True
+            if key and prov.get('apiKey') != key:
+                prov['apiKey'] = key
+                changed = True
+            if model:
+                models = prov.get('models') if isinstance(prov.get('models'), list) and prov.get('models') else [{}]
+                if not isinstance(models[0], dict):
+                    models = [{}]
+                if models[0].get('id') != model:
+                    models[0]['id'] = model
+                    changed = True
+                prov['models'] = models
+        if primary_ref:
+            ref = data.setdefault('agents', {}).setdefault('defaults', {}).setdefault('model', {})
+            if ref.get('primary') != primary_ref:
+                ref['primary'] = primary_ref
+                changed = True
+        if not changed:
+            return ''
+        shutil.copy2(oc, oc.parent / (oc.name + '.bak-web'))
+        tmp = oc.parent / (oc.name + '.tmp')
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
+        tmp.replace(oc)
+        return 'openclaw 已同步（下一条消息生效）'
+    except Exception as e:  # noqa: BLE001
+        return f'openclaw 同步失败：{e}'
+
+
+class ModelSaveRow(BaseModel):
+    slot: str = ""
+    name: str = ""
+    model: str = ""
+    baseUrl: str = ""
+    key: str = ""
+    key2: str = ""
+    primary: bool = False
+
+
+class ModelSaveRequest(BaseModel):
+    channel: str = "chat"
+    rows: list[ModelSaveRow] = Field(default_factory=list)
+
+
+@app.post("/api/settings/models/save")
+async def api_settings_models_save(req: ModelSaveRequest):
+    """保存模型通道：.env 就地更新（key 留空=不改）；chat 同步 openclaw；媒体通道写 provider 配置。"""
+    ch0 = (req.channel or "").strip()
+    if ch0 in ("speech", "image", "video", "music"):
+        import model_registry as _mr2
+        _gid0 = {"speech": "voice", "image": "image", "video": "video", "music": "music"}[ch0]
+        _spec0 = _mr2.MODEL_GROUPS[_gid0]
+        _by_id = {p["id"]: p for p in _spec0["providers"]}
+        _setting0 = {"video": "VIDEO_PROVIDER", "music": "MUSIC_PROVIDER", "voice": "VOICE_PROVIDER"}.get(_gid0)
+        _mupd: dict[str, str] = {}
+        _primary0 = ""
+        for _row in req.rows:
+            _pid = (_row.slot or "").strip()
+            _p0 = _by_id.get(_pid)
+            if not _p0:
+                raise HTTPException(400, f"不认识的服务商：{_pid or '（空）'}")
+            _base0 = (_row.baseUrl or "").strip().rstrip("/")
+            _key0 = (_row.key or "").strip()
+            _key20 = (_row.key2 or "").strip()
+            _model0 = (_row.model or "").strip()
+            if _base0 and not re.match(r"^https?://", _base0):
+                raise HTTPException(400, f'{_p0["name"]} 的根地址需以 http(s):// 开头')
+            if (_key0 and any(x.isspace() for x in _key0)) or (_key20 and any(x.isspace() for x in _key20)):
+                raise HTTPException(400, f'{_p0["name"]} 的 Key 不能包含空白字符')
+            _bk0 = next((k for k in _p0["keys"] if not k["secret"]
+                         and ("BASE" in k["env"] or "URL" in k["env"])), None)
+            _mk0 = next((k for k in _p0["keys"] if not k["secret"] and "MODEL" in k["env"]), None)
+            _req0 = [k for k in _p0["keys"] if k["required"] and k is not _bk0 and k is not _mk0]
+            if _key0 and _req0:
+                _mupd[_req0[0]["env"]] = _key0
+            if _key20 and len(_req0) > 1:
+                _mupd[_req0[1]["env"]] = _key20
+            if _model0 and _mk0:
+                _mupd[_mk0["env"]] = _model0
+            if _base0 and _bk0:
+                _mupd[_bk0["env"]] = _base0
+            if getattr(_row, "primary", False):
+                _primary0 = _pid
+        if _primary0 and _setting0:
+            _mupd[_setting0] = _primary0
+        if not _mupd:
+            raise HTTPException(400, "没有可保存的改动（key 留空表示不改）")
+        _write_env_direct(_mupd)
+        _resp0 = {"ok": True, "note": ""}
+        _resp0.update(_model_channels())
+        return _resp0
+
+    updates: dict[str, str] = {}
+    provider_updates: dict[str, dict] = {}
+    keep_custom: set[str] = set()
+    primary_ref = ''
+    is_chat = (req.channel or '').strip() == 'chat'
+    for row in req.rows:
+        slot = (row.slot or '').strip()
+        name = (row.name or '').strip().lower()
+        model = (row.model or '').strip()
+        base = (row.baseUrl or '').strip().rstrip('/')
+        key = (row.key or '').strip()
+        if base and not re.match(r'^https?://', base):
+            raise HTTPException(400, f'Base URL 需以 http(s):// 开头：{base[:60]}')
+        if key and any(ch.isspace() for ch in key):
+            raise HTTPException(400, 'API Key 不能包含空白字符')
+        if len(model) > 120 or len(base) > 300 or len(key) > 400:
+            raise HTTPException(400, '字段过长，请检查')
+        pkey = ''
+        if slot == 'openai':
+            if model:
+                updates['OPENAI_MODEL'] = model
+            if base:
+                updates['OPENAI_BASE_URL'] = base
+            if key:
+                updates['OPENAI_API_KEY'] = key
+            if is_chat:
+                provider_updates['openai'] = {'model': model, 'base': base, 'key': key}
+                pkey = 'openai'
+        elif slot == 'relay':
+            if base:
+                updates['EASEL_LLM_BASE_URL'] = base
+            if model:
+                updates['CLAUDE_MODEL'] = model
+            if key:
+                updates['EASEL_LLM_API_KEY'] = key
+            if is_chat:
+                pkey = 'relay'
+        elif slot == 'anthropic':
+            if model:
+                updates['CLAUDE_MODEL'] = model
+            if key:
+                updates['ANTHROPIC_API_KEY'] = key
+            if is_chat:
+                pkey = 'anthropic'
+        elif slot == 'siliconflow':
+            if base:
+                updates['SILICONFLOW_BASE_URL'] = base
+            if key:
+                updates['SILICONFLOW_API_KEY'] = key
+        elif slot == 'custom' and is_chat:
+            if not re.fullmatch(r'[a-z0-9][a-z0-9-]{0,23}', name):
+                raise HTTPException(400, f'供应商名只能用小写字母/数字/横线（最长24位）：{name[:30] or "（空）"}')
+            if name in RESERVED_PROVIDER_KEYS:
+                raise HTTPException(400, f'「{name}」是内置槽位名，请换一个')
+            if not model or not base:
+                raise HTTPException(400, f'自定义供应商「{name}」需要同时填模型和 Base URL')
+            provider_updates[name] = {'model': model, 'base': base, 'key': key}
+            keep_custom.add(name)
+            pkey = name
+        if is_chat and pkey and getattr(row, 'primary', False) and model:
+            primary_ref = f'{pkey}/{model}'
+    if not updates and not provider_updates and not primary_ref:
+        raise HTTPException(400, '没有可保存的改动（key 留空表示不改）')
+    if updates:
+        _write_env_direct(updates)
+    note = ''
+    if is_chat:
+        note = _sync_openclaw_chat(provider_updates, keep_custom, primary_ref)
+    resp = {"ok": True, "note": note}
+    resp.update(_model_channels())
+    return resp
+
+
+class SelftestRequest(BaseModel):
+    channel: str = "chat"
+
+
+@app.post("/api/settings/models/selftest")
+async def api_models_selftest(req: SelftestRequest):
+    """真自测：对已配置的 OpenAI 兼容通道发 GET {base}/models 并计耗时。"""
+    channel = (req.channel or "all").strip()
+    env = _read_env()
+    targets: list[tuple[str, str]] = []
+    if channel in ("chat", "all"):
+        for base, key in ((env.get("ANTHROPIC_BASE_URL", ""), env.get("ANTHROPIC_API_KEY", "")),
+                          (env.get("OPENAI_BASE_URL", ""), env.get("OPENAI_API_KEY", "")),
+                          (env.get("EASEL_LLM_BASE_URL", ""), env.get("EASEL_LLM_API_KEY", ""))):
+            if base.strip() and key.strip():
+                targets.append((base.strip().rstrip("/"), key.strip()))
+    if channel in ("transcribe", "all") and (env.get("SILICONFLOW_API_KEY") or "").strip():
+        targets.append(((env.get("SILICONFLOW_BASE_URL") or "https://api.siliconflow.cn/v1").strip().rstrip("/"),
+                        env["SILICONFLOW_API_KEY"].strip()))
+
+    def _probe(base: str, key: str) -> dict:
+        t0 = time.time()
+        try:
+            rq = urllib.request.Request(base + "/models", headers={"Authorization": f"Bearer {key}"})
+            with urllib.request.urlopen(rq, timeout=15) as resp:
+                return {"baseUrl": base, "ok": resp.status == 200, "ms": int((time.time() - t0) * 1000)}
+        except Exception as e:  # noqa: BLE001
+            return {"baseUrl": base, "ok": False, "ms": int((time.time() - t0) * 1000),
+                    "detail": f"{type(e).__name__}: {e}"[:140]}
+
+    results = await asyncio.to_thread(lambda: [_probe(b, k) for b, k in targets])
+    return {"channel": channel, "results": results, "testedAt": int(time.time())}
+
+
 class AttachmentRef(BaseModel):
     id: str
     name: str
