@@ -1793,7 +1793,10 @@ async def api_skill(req: SkillRequest):
 
 
 @app.get("/api/outputs")
-async def api_outputs():
+def api_outputs():
+    # 产物树是全量递归扫描（文件量大时单次可达数十秒）。必须是同步 handler：
+    # FastAPI 会自动放入线程池执行；若写成 async def 直调，扫描期间会阻塞事件循环，
+    # 全站所有请求（含 /api/status）一起挂起等它。
     return get_output_tree()
 
 
