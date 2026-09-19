@@ -17,6 +17,7 @@ $OC 换成记录器，所以测的是真代码、不是复制品。
 """
 from __future__ import annotations
 
+import functools
 import json
 import os
 import re
@@ -36,6 +37,26 @@ from easel.commands import doctor  # noqa: E402
 
 
 # ── setup.sh：把真代码切出来在沙箱里跑 ────────────────────────────────
+
+
+@functools.lru_cache(maxsize=1)
+def _bash_works() -> bool:
+    """有没有能真跑 POSIX 脚本的 bash。
+
+    不能只看 `shutil.which("bash")`：Windows 上 System32\\bash.exe 是 WSL 的入口，
+    没装发行版时它照样在 PATH 里，跑起来却只会打印「has no installed distributions」，
+    于是断言拿到一串 UTF-16 的错误提示、报得莫名其妙。跑一下才算数。
+    """
+    try:
+        p = subprocess.run(["bash", "-c", "echo ok"], capture_output=True, text=True,
+                           timeout=30, errors="replace")
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return p.returncode == 0 and p.stdout.strip() == "ok"
+
+
+# setup.sh 是 Linux/macOS 的安装路径，Windows 走 setup.ps1（另有静态用例守着）。
+needs_bash = pytest.mark.skipif(not _bash_works(), reason="没有可用的 bash，跳过 setup.sh 用例")
 
 
 def _slice(lines: list[str], start: str, end: str, *, keep_end: bool) -> str:
@@ -94,6 +115,7 @@ DEEPSEEK = {
 }
 
 
+@needs_bash
 def test_placeholder_does_not_block_openai_branch(tmp_path):
     """核心回归：占位符没删 + 配了 OpenAI 兼容服务 → provider 必须真的写出来。"""
     out, written = _run_auth(tmp_path, ANTHROPIC_API_KEY=PLACEHOLDER, **DEEPSEEK)
@@ -103,6 +125,7 @@ def test_placeholder_does_not_block_openai_branch(tmp_path):
     assert "WARN|认证未配置" not in out
 
 
+@needs_bash
 def test_placeholder_present_or_absent_gives_same_result(tmp_path):
     """删不删那行占位符，结果必须完全一致 —— 用户没义务知道要删它。"""
     _, with_ph = _run_auth(tmp_path, ANTHROPIC_API_KEY=PLACEHOLDER, **DEEPSEEK)
@@ -110,6 +133,7 @@ def test_placeholder_present_or_absent_gives_same_result(tmp_path):
     assert with_ph == without
 
 
+@needs_bash
 def test_nothing_configured_writes_no_primary(tmp_path):
     """什么都没配时不许写 primary：写了只会指向不存在的 provider，比「没配置」更难查。"""
     out, written = _run_auth(tmp_path, ANTHROPIC_API_KEY=PLACEHOLDER,
@@ -118,6 +142,7 @@ def test_nothing_configured_writes_no_primary(tmp_path):
     assert "WARN|认证未配置" in out
 
 
+@needs_bash
 def test_real_anthropic_key_still_works(tmp_path):
     """别把闸修成谁都过不去：正经 key 必须照常同步。"""
     out, written = _run_auth(tmp_path, ANTHROPIC_API_KEY="sk-ant-real",
@@ -126,6 +151,7 @@ def test_real_anthropic_key_still_works(tmp_path):
     assert written["agents.defaults.model.primary"] == "anthropic/claude-sonnet-4-6"
 
 
+@needs_bash
 def test_anthropic_takes_priority_over_openai(tmp_path):
     """两个都配了真 key 时，优先级保持原样（Anthropic 胜出）。"""
     _, written = _run_auth(tmp_path, ANTHROPIC_API_KEY="sk-ant-real", **DEEPSEEK)
@@ -137,6 +163,7 @@ def test_anthropic_takes_priority_over_openai(tmp_path):
     "REPLACE_ME", "sk-ant-REPLACE_ME", "replace_me",
     "your-api-key", "YOUR_API_KEY", "your api key", "",
 ])
+@needs_bash
 def test_usable_key_rejects_placeholders(tmp_path, value):
     lines = SETUP_SH.read_text(encoding="utf-8").splitlines()
     helper = _slice(lines, "usable_key() {", "}", keep_end=True)
@@ -148,6 +175,7 @@ def test_usable_key_rejects_placeholders(tmp_path, value):
 
 
 @pytest.mark.parametrize("value", ["sk-ant-abc123", "sk-proj-xyz", "local-adapter"])
+@needs_bash
 def test_usable_key_accepts_real_keys(tmp_path, value):
     lines = SETUP_SH.read_text(encoding="utf-8").splitlines()
     helper = _slice(lines, "usable_key() {", "}", keep_end=True)
@@ -279,5 +307,34 @@ def test_user_path_dir_never_interpolated_into_script():
     # 脚本是模块级常量，不带任何格式化占位，不可能把目录拼进去
     assert "%s" not in install_tool._PS_APPEND_USER_PATH
     assert ".format(" not in install_tool._PS_APPEND_USER_PATH
-    # 非 Windows 平台一律不碰系统配置
+
+
+def test_json_output_survives_non_utf8_locale():
+    """配方表输出全是中文，stdout 是管道时不能被系统 locale 编码噎死。
+
+    Windows 上 stdout 一旦被面板/agent 捕获，Python 就按 cp936/cp1252 写，中文直接
+    UnicodeEncodeError、stdout 一个字节不出 —— 调用方只看到「配方表是空的」，
+    安装接口的 id 白名单随之永远为空，装什么都被拒。这里用 PYTHONIOENCODING
+    在 Linux 上复现同一条件。
+    """
+    proc = subprocess.run(
+        [sys.executable, str(PROJECT_ROOT / "skills" / "shared" / "scripts" / "install_tool.py"),
+         "--json", "list"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120,
+        env={**os.environ, "PYTHONIOENCODING": "cp1252"})
+    assert proc.returncode == 0, f"非 UTF-8 locale 下崩了：{proc.stderr[-500:]}"
+    ids = {t["id"] for t in json.loads(proc.stdout)["tools"]}
+    assert "node" in ids, f"配方表没出来：{ids}"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows 上这个调用会真改注册表，不能在测试里跑")
+def test_user_path_is_noop_off_windows():
+    """非 Windows 平台一律不碰系统配置。
+
+    注意别把这条写成无条件跑：`_ensure_user_path` 在 Windows 上是**真的**去改当前
+    用户的 PATH 注册表项的，测试里调一次就会把参数里那个假目录永久写进去。
+    """
+    sys.path.insert(0, str(PROJECT_ROOT / "skills" / "shared" / "scripts"))
+    import install_tool
+
     assert install_tool._ensure_user_path("/tmp/whatever") == "skip"

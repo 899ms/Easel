@@ -557,6 +557,16 @@ def cmd_selftest(_a) -> int:
 
 
 def main() -> int:
+    # 输出里全是中文。Windows 上 stdout 一旦是管道（被面板/agent 捕获），Python 就按
+    # 系统 locale 编码（cp936/cp1252）写，配方表里的中文直接 UnicodeEncodeError 崩掉，
+    # stdout 一个字节都不出 —— 调用方拿到空串，只会以为「配方表是空的」。
+    # 面板的安装接口就是这么被整条废掉的：id 白名单永远为空，装什么都报「无效的工具 id」。
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):  # 被重定向成非 TextIOWrapper 时忽略
+            pass
+
     ap = argparse.ArgumentParser(
         description="环境工具一键安装器（检测 → 一键装 → 装后校验）",
         formatter_class=argparse.RawDescriptionHelpFormatter)
