@@ -29,7 +29,8 @@ from pathlib import Path
 # ═══════════════════════════════════════════════════════════════════════
 # 工具配方
 #   check[0] 为 "@pyfn:<名字>" 时走内置函数检查；否则按 argv 跑（占位符：
-#   {python} = 解析出的目标解释器；{dir} = --dir 传入的工程目录）
+#   {python} = 解析出的目标解释器；{dir} = --dir 传入的工程目录，只能整元素
+#   替换 —— 目录是外部输入，拼进 -c 源码文本会被引号逃逸成任意代码）
 #   install = [(策略名, argv[, 超时秒]), ...] 依次尝试
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -119,7 +120,9 @@ TOOLS: list[Tool] = [
          + [("hf-mirror 下载 large-v3", ["{python}", "-c", WHISPER_MODEL_PY], 7200)],
          big=True),
     Tool("rmdeps", "Remotion 工程依赖", "rm", "蓝本内置 · npm ci 还原（镜像加速）",
-         ["{python}", "-c", "import os,sys;sys.exit(0 if os.path.isdir(os.path.join(r'{dir}','node_modules')) else 1)"],
+         ["{python}", "-c",
+          "import os,sys;sys.exit(0 if os.path.isdir(os.path.join(sys.argv[1],'node_modules')) else 1)",
+          "{dir}"],
          [("npm ci · npmmirror 镜像", ["npm", "ci", "--registry=https://registry.npmmirror.com"], 1800)],
          needs_dir=True),
     Tool("shell", "Chrome Headless Shell", "rm", "渲染用 · 随 Remotion 下载",
@@ -264,13 +267,18 @@ def _die(msg: str, code: int = 1) -> None:
 
 
 def _fill(argv: list[str], python: str, dir_: str | None) -> list[str]:
+    """占位符替换。{dir} 只认「整个元素就是 {dir}」的写法，永远作为独立 argv
+    元素落地 —— 拼进更大的串（尤其 -c 的源码文本）时目录里一个引号就能逃逸
+    成可执行代码，故此处直接拒绝，属结构性保证而非约定。"""
     out = []
     for a in argv:
         a = a.replace("{python}", python)
         if "{dir}" in a:
+            if a != "{dir}":
+                raise ValueError(f"配方非法：{{dir}} 只能单独成一个参数，不可拼进 {a!r}")
             if not dir_:
                 raise ValueError("需要 --dir")
-            a = a.replace("{dir}", dir_)
+            a = dir_
         out.append(a)
     return out
 
@@ -345,7 +353,13 @@ def check_all(python: str, dir_: str | None = None, only: list[str] | None = Non
 
 
 def _ensure_user_path(d: str) -> str:
-    """把目录追加进用户 PATH（幂等）。返回 changed | present | fail。"""
+    """把目录追加进用户 PATH（幂等）。返回 changed | present | fail | skip。
+
+    只有 Windows 才有「用户级持久 PATH」这回事；别的平台直接 skip（不碰、也不
+    往 detail 里塞失败串）。
+    """
+    if os.name != "nt":
+        return "skip"
     ps = shutil.which("powershell") or "powershell"
     try:
         cur = subprocess.run(
@@ -357,12 +371,14 @@ def _ensure_user_path(d: str) -> str:
         if any(os.path.normcase(p) == os.path.normcase(d.rstrip("\\/")) for p in parts):
             return "present"
         new = (cur + ";" if cur and not cur.endswith(";") else cur) + d
-        subprocess.run(
+        # 新值走子进程环境变量递过去，绝不拼进命令串：PATH 里只要有一个单引号，
+        # 拼串写法就会截断字面量、后半截被当 PowerShell 代码执行
+        proc = subprocess.run(
             [ps, "-NoProfile", "-Command",
-             f"[Environment]::SetEnvironmentVariable('Path', '{new}', 'User')"],
+             "[Environment]::SetEnvironmentVariable('Path', $env:EASEL_NEW_PATH, 'User')"],
             capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=60)
-        return "changed"
+            timeout=60, env={**os.environ, "EASEL_NEW_PATH": new})
+        return "changed" if proc.returncode == 0 else "fail"
     except Exception:  # noqa: BLE001
         return "fail"
 

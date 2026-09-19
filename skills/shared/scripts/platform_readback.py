@@ -747,8 +747,14 @@ def _bilibili_load_cookies(cookie_file) -> str:
     return "; ".join(pairs)
 
 
+# 读回也走直连：urllib 默认会吃 http_proxy/https_proxy 环境变量，开着系统代理/VPN 时
+# 读回会从境外出口打 B站（投稿侧已由 bili_upload._direct_env 直连）——空 ProxyHandler 屏蔽之，
+# 保证「投稿直连、读回也直连」一致，不触发风控。
+_DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
 def _bilibili_api(cookie_file, url: str, *, timeout_s: float = 20.0) -> dict[str, Any]:
-    """直连请求 B站 web API（带 cookies）。网络类错误包成 RuntimeError。"""
+    """直连请求 B站 web API（带 cookies，绕过环境/系统代理）。网络类错误包成 RuntimeError。"""
     req = urllib.request.Request(url, headers={
         "Cookie": _bilibili_load_cookies(cookie_file),
         "User-Agent": BILIBILI_UA,
@@ -757,7 +763,7 @@ def _bilibili_api(cookie_file, url: str, *, timeout_s: float = 20.0) -> dict[str
     last: Exception | None = None
     for attempt in (1, 2):
         try:
-            with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            with _DIRECT_OPENER.open(req, timeout=timeout_s) as resp:
                 return json.loads(resp.read().decode("utf-8"))
         except Exception as exc:  # noqa: BLE001
             last = exc

@@ -43,6 +43,9 @@ async function fetchWithRetry<T>(fn: () => Promise<T>, tries = 4, timeoutMs = 18
   throw lastErr;
 }
 
+/** 后端放在 model/baseUrl 里的展示占位串——提交前要清掉，它们不是真实配置值。 */
+const PLACEHOLDERS = new Set(['—', '官方', '（未配置）', '本机', '内建默认']);
+
 const hhmm = (ts: number) => {
   const d = new Date(ts * 1000);
   return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
@@ -197,8 +200,10 @@ export default function SettingsPanel({ onClose }: Props) {
       .map((r) => ({
         slot: r.slot as string,
         name: r.slot === 'custom' ? r.name.trim().toLowerCase() : '',
-        model: r.model === '—' ? '' : r.model,
-        baseUrl: r.baseUrl === '—' ? '' : r.baseUrl,
+        // 后端在这些字段里塞的是展示占位（'官方'/'（未配置）'/'本机'/'—'），不是真值：
+        // 原样回传会被后端的 Base URL 校验打成 400，导致该行永远保存不了。
+        model: PLACEHOLDERS.has(r.model) ? '' : r.model,
+        baseUrl: PLACEHOLDERS.has(r.baseUrl) ? '' : r.baseUrl,
         key: r.keyNew || '',
         key2: r.keyNew2 || '',
         primary: r.role === '主',
@@ -227,7 +232,7 @@ export default function SettingsPanel({ onClose }: Props) {
       setSaving(false);
       setTimeout(() => setSavedNote(''), 6000);
     }
-  }, [chan, chatRows, transRows, refreshEnv]);
+  }, [chan, chatRows, transRows, mediaRows, refreshEnv]);
 
   // Esc 关闭
   useEffect(() => {
