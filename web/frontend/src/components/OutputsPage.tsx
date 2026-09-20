@@ -152,7 +152,10 @@ export default function OutputsPage() {
     if (selected.kind === 'audio') return <audio src={url} controls style={{ width: '100%' }} />;
     if (selected.kind === 'text' && isHtml(selected.name)) return (
       <>
-        <iframe src={url} title={selected.name} sandbox=""
+        {/* allow-scripts：让预览页自带的「复制到公众号」按钮(execCommand('copy'))能运行；
+            allow="clipboard-write"：授予剪贴板写权限。不给 allow-same-origin —— iframe 保持
+            opaque origin，脚本跑得起来但访问不到本站，安全。(修复：内嵌预览里复制按钮点了没反应) */}
+        <iframe src={`${url}?v=${selected.mtime ?? 0}`} title={selected.name} sandbox="allow-scripts" allow="clipboard-write"
           style={{ width: '100%', height: '68vh', border: '1px solid var(--border)', borderRadius: 'var(--radius)', background: '#fff' }} />
         <div style={{ marginTop: 8 }}><a href={url} target="_blank" rel="noreferrer" style={{ color: 'var(--accent-start)', fontSize: 13 }}>在新标签打开 ↗</a></div>
       </>
