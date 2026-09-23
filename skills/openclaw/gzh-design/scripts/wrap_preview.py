@@ -13,8 +13,40 @@ validate_gzh_html.py（本预览页含 script/style，不参与校验）。
     默认输出 <section去扩展名>_预览.html
 """
 
+import base64
+import mimetypes
 import os
+import re
 import sys
+from urllib.parse import unquote
+
+# 把正文里引用本地图片的 <img src="xxx.png"> 内联成 base64 data-URI。
+# 复制粘贴进公众号时，图片字节随剪贴板一起走，公众号会把内联图上传到自己 CDN；
+# 否则它要回源抓 src 指向的 Easel 本地/相对地址 → 抓不到 → 图片超时/裂图。
+_IMG_SRC = re.compile(r'(<img\b[^>]*?\bsrc\s*=\s*)(["\'])(.*?)\2', re.IGNORECASE)
+_INLINE_EXT = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp"}
+
+
+def _inline_images(html, base_dir):
+    def repl(m):
+        prefix, quote, src = m.group(1), m.group(2), m.group(3)
+        s = src.strip()
+        # 已是 data-URI / 远程 http(s) / 协议相对，跳过
+        if s.startswith(("data:", "http://", "https://", "//")):
+            return m.group(0)
+        path = unquote(s.split("?", 1)[0].split("#", 1)[0])
+        img = path if os.path.isabs(path) else os.path.join(base_dir, path)
+        ext = os.path.splitext(img)[1].lower()
+        if ext not in _INLINE_EXT or not os.path.isfile(img):
+            return m.group(0)  # 找不到/不支持就原样保留
+        try:
+            data = open(img, "rb").read()
+        except OSError:
+            return m.group(0)
+        mime = mimetypes.guess_type(img)[0] or ("image/svg+xml" if ext == ".svg" else "image/png")
+        b64 = base64.b64encode(data).decode("ascii")
+        return f'{prefix}{quote}data:{mime};base64,{b64}{quote}'
+    return _IMG_SRC.sub(repl, html)
 
 
 def main():
@@ -27,6 +59,8 @@ def main():
         sys.exit(1)
 
     content = open(src, encoding="utf-8").read().strip()
+    # 本地图内联 base64，让「复制到公众号」粘贴后图片不裂（相对路径按 section 文件所在目录解析）
+    content = _inline_images(content, os.path.dirname(os.path.abspath(src)))
     tpl_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                             "..", "assets", "preview-template.html")
     tpl = open(tpl_path, encoding="utf-8").read()
